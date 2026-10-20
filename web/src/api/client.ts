@@ -306,19 +306,19 @@ export function downloadJson(filename: string, data: unknown): void {
 export const api = {
   // 剧本：项目 / 角色卡 / 场次 / 台词 / 版本 / 导出
   listProjects: () =>
-    request<unknown>("/api/screenplay/projects").then((r) => asList<Project>(r)),
+    request<unknown>("/api/v1/screenplay/projects").then((r) => asList<Project>(r)),
   createProject: (b: { title: string; logline?: string }) =>
-    request<Project>("/api/screenplay/projects", { method: "POST", body: b }),
+    request<Project>("/api/v1/screenplay/projects", { method: "POST", body: b }),
 
   listCharacters: (projectId: string) =>
-    request<unknown>(`/api/screenplay/projects/${enc(projectId)}/characters`).then((r) =>
+    request<unknown>(`/api/v1/screenplay/projects/${enc(projectId)}/characters`).then((r) =>
       asList<Character>(r),
     ),
   createCharacter: (
     projectId: string,
     b: { name: string; appearance: Record<string, string>; stance?: string },
   ) =>
-    request<Character>(`/api/screenplay/projects/${enc(projectId)}/characters`, {
+    request<Character>(`/api/v1/screenplay/projects/${enc(projectId)}/characters`, {
       method: "POST",
       body: b,
     }),
@@ -327,68 +327,76 @@ export const api = {
     characterId: string,
     b: { name: string; appearance: Record<string, string>; stance?: string },
   ) =>
-    request<Character>(`/api/screenplay/projects/${enc(projectId)}/characters/${enc(characterId)}`, {
+    request<Character>(`/api/v1/screenplay/projects/${enc(projectId)}/characters/${enc(characterId)}`, {
       method: "PUT",
       body: b,
     }),
   deleteCharacter: (projectId: string, characterId: string) =>
-    request<unknown>(`/api/screenplay/projects/${enc(projectId)}/characters/${enc(characterId)}`, {
+    request<unknown>(`/api/v1/screenplay/projects/${enc(projectId)}/characters/${enc(characterId)}`, {
       method: "DELETE",
     }),
 
   listScenes: (projectId: string) =>
-    request<unknown>("/api/scenes", { query: { project_id: projectId } }).then((r) =>
+    request<unknown>(`/api/v1/screenplay/projects/${enc(projectId)}/scenes`).then((r) =>
       asList<Scene>(r),
     ),
   createScene: (projectId: string, b: { title: string; conflict?: string }) =>
-    request<Scene>("/api/scenes", { method: "POST", body: { project_id: projectId, ...b } }),
-  updateScene: (sceneId: string, b: { title?: string; conflict?: string }) =>
-    request<Scene>(`/api/scenes/${enc(sceneId)}`, { method: "PUT", body: b }),
-  deleteScene: (sceneId: string) =>
-    request<unknown>(`/api/scenes/${enc(sceneId)}`, { method: "DELETE" }),
+    request<Scene>(`/api/v1/screenplay/projects/${enc(projectId)}/scenes`, {
+      method: "POST",
+      body: b,
+    }),
+  updateScene: (projectId: string, sceneId: string, b: { title?: string; conflict?: string }) =>
+    request<Scene>(`/api/v1/screenplay/projects/${enc(projectId)}/scenes/${enc(sceneId)}`, {
+      method: "PUT",
+      body: b,
+    }),
+  deleteScene: (projectId: string, sceneId: string) =>
+    request<unknown>(`/api/v1/screenplay/projects/${enc(projectId)}/scenes/${enc(sceneId)}`, {
+      method: "DELETE",
+    }),
 
   listLines: (sceneId: string) =>
-    request<unknown>(`/api/scenes/${enc(sceneId)}/lines`).then((r) => asList<Line>(r)),
+    request<unknown>(`/api/v1/screenplay/scenes/${enc(sceneId)}/lines`).then((r) => asList<Line>(r)),
   createLine: (sceneId: string, b: { character_id?: string; text: string }) =>
-    request<Line>(`/api/scenes/${enc(sceneId)}/lines`, { method: "POST", body: b }),
+    request<Line>(`/api/v1/screenplay/scenes/${enc(sceneId)}/lines`, { method: "POST", body: b }),
   updateLine: (sceneId: string, lineId: string, b: { character_id?: string; text: string }) =>
-    request<Line>(`/api/scenes/${enc(sceneId)}/lines/${enc(lineId)}`, { method: "PUT", body: b }),
+    request<Line>(`/api/v1/screenplay/scenes/${enc(sceneId)}/lines/${enc(lineId)}`, { method: "PUT", body: b }),
   deleteLine: (sceneId: string, lineId: string) =>
-    request<unknown>(`/api/scenes/${enc(sceneId)}/lines/${enc(lineId)}`, { method: "DELETE" }),
+    request<unknown>(`/api/v1/screenplay/scenes/${enc(sceneId)}/lines/${enc(lineId)}`, { method: "DELETE" }),
 
   listVersions: (projectId: string) =>
-    request<unknown>(`/api/projects/${enc(projectId)}/versions`).then((r) =>
+    request<unknown>(`/api/v1/screenplay/projects/${enc(projectId)}/versions`).then((r) =>
       asList<VersionEntry>(r),
     ),
   createVersion: (projectId: string, label?: string) =>
-    request<VersionEntry>(`/api/projects/${enc(projectId)}/versions`, {
+    request<VersionEntry>(`/api/v1/screenplay/projects/${enc(projectId)}/versions`, {
       method: "POST",
       body: label ? { label } : {},
     }),
   restoreVersion: (projectId: string, versionId: string) =>
-    request<unknown>(`/api/projects/${enc(projectId)}/restore/${enc(versionId)}`, {
+    request<unknown>(`/api/v1/screenplay/projects/${enc(projectId)}/restore/${enc(versionId)}`, {
       method: "POST",
       body: {},
     }),
   exportProject: (projectId: string) =>
-    request<unknown>(`/api/projects/${enc(projectId)}/export`),
+    request<unknown>(`/api/v1/screenplay/projects/${enc(projectId)}/export`),
 
   // 哲思内核：接入 / 状态 / 注入
-  kernelLink: () => request<KernelStatus>("/api/kernel/link", { method: "POST", body: {} }),
-  kernelStatus: () => request<KernelStatus>("/api/kernel/status"),
+  kernelLink: () => request<KernelStatus>("/api/v1/kernel/link", { method: "POST", body: {} }),
+  kernelStatus: () => request<KernelStatus>("/api/v1/kernel/status"),
   kernelInject: (projectId: string, b: { scene_id?: string; character_id?: string }) =>
-    request<unknown>(`/api/kernel/inject/${enc(projectId)}`, { method: "POST", body: b }),
+    request<unknown>(`/api/v1/kernel/inject/${enc(projectId)}`, { method: "POST", body: b }),
 
   // 底料：分镜表 / 镜头编辑 / 三形态提示词
   genStoryboard: (sceneId: string) =>
-    request<Storyboard>(`/api/pipeline/storyboard/${enc(sceneId)}`, { method: "POST", body: {} }),
+    request<Storyboard>(`/api/v1/pipeline/storyboard/${enc(sceneId)}`, { method: "POST", body: {} }),
   updateShot: (storyboardId: string, idx: number, shot: StoryboardShot) =>
-    request<unknown>(`/api/pipeline/storyboard/${enc(storyboardId)}/${enc(String(idx))}`, {
+    request<unknown>(`/api/v1/pipeline/storyboard/${enc(storyboardId)}/${enc(String(idx))}`, {
       method: "PUT",
       body: shot,
     }),
   genPrompts: (storyboardId: string) =>
-    request<PromptSetRef>(`/api/pipeline/prompts/${enc(storyboardId)}`, { method: "POST", body: {} }),
+    request<PromptSetRef>(`/api/v1/pipeline/prompts/${enc(storyboardId)}`, { method: "POST", body: {} }),
   getPrompt: (promptSetId: string, form: PromptForm) =>
-    request<unknown>(`/api/pipeline/prompts/${enc(promptSetId)}`, { query: { form } }),
+    request<unknown>(`/api/v1/pipeline/prompts/${enc(promptSetId)}`, { query: { form } }),
 };

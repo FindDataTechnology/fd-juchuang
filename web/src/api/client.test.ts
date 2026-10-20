@@ -57,7 +57,7 @@ describe("URL 拼装与 token 头", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
     expect(API_BASE).toBe(""); // 同源契约：默认无跨源 base
-    expect(String(url)).toBe(`http://localhost/api/scenes?project_id=p1`);
+    expect(String(url)).toBe(`http://localhost/api/v1/screenplay/projects/p1/scenes`);
     expect(new Headers(init.headers).get("authorization")).toBe("Bearer ui-tok");
     expect(init.method).toBe("GET");
     expect(init.body).toBeUndefined();
@@ -70,7 +70,7 @@ describe("URL 拼装与 token 头", () => {
     await api.createProject({ title: "北渡", logline: "一个摆渡人的傍晚" });
 
     const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
-    expect(String(url)).toBe(`http://localhost/api/screenplay/projects`);
+    expect(String(url)).toBe(`http://localhost/api/v1/screenplay/projects`);
     expect(init.method).toBe("POST");
     expect(new Headers(init.headers).get("content-type")).toBe("application/json");
     expect(JSON.parse(String(init.body))).toEqual({ title: "北渡", logline: "一个摆渡人的傍晚" });
@@ -83,7 +83,7 @@ describe("URL 拼装与 token 头", () => {
     await api.updateShot("sb 1", 2, { idx: 2, shot_size: "特写", visual: "v", action: "a", line: "l", duration: 3 });
 
     const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
-    expect(String(url)).toBe(`http://localhost/api/pipeline/storyboard/sb%201/2`);
+    expect(String(url)).toBe(`http://localhost/api/v1/pipeline/storyboard/sb%201/2`);
     expect(init.method).toBe("PUT");
     expect(JSON.parse(String(init.body))).toMatchObject({ idx: 2, shot_size: "特写" });
   });
@@ -96,10 +96,10 @@ describe("URL 拼装与 token 头", () => {
     await api.listCharacters("proj id/1");
 
     const [u1, init1] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
-    expect(String(u1)).toBe(`http://localhost/api/scenes/scene%20id%2F1/lines/line%2F9`);
+    expect(String(u1)).toBe(`http://localhost/api/v1/screenplay/scenes/scene%20id%2F1/lines/line%2F9`);
     expect(init1.method).toBe("DELETE");
     const [u2] = fetchMock.mock.calls[1] as unknown as [URL, RequestInit];
-    expect(String(u2)).toBe(`http://localhost/api/screenplay/projects/proj%20id%2F1/characters`);
+    expect(String(u2)).toBe(`http://localhost/api/v1/screenplay/projects/proj%20id%2F1/characters`);
   });
 
   it("提示词 GET 带 form query", async () => {
@@ -109,7 +109,7 @@ describe("URL 拼装与 token 头", () => {
     await api.getPrompt("ps1", "video");
 
     const [url] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
-    expect(String(url)).toBe(`http://localhost/api/pipeline/prompts/ps1?form=video`);
+    expect(String(url)).toBe(`http://localhost/api/v1/pipeline/prompts/ps1?form=video`);
   });
 
   it("未设 token 时不发 Authorization 头", async () => {

@@ -1,13 +1,8 @@
-"""E2E 验收剧本（task 7.1）：新用户全链 + 双账号隔离。
+"""剧创 E2E 验收剧本（task 5.1）：双账号全链 + 降级独立模式。
 
-链路：生活语言提问 → 概念澄清 → 表态 → 承受最强反驳并回应 → 补足立场后合成投影
-→ 张力检测 → 思想年轮 → 剧创结构卡（授权→取卡）。双账号各跑一遍并互查隔离。
-
-用法（本地，真参照系库）：
-  FD_JUCHUANG_DB=/tmp/e2e.db FD_JUCHUANG_AUTH_DEV_TOKENS="tok-a=alice,tok-b=bob" \
-  python3 -m uvicorn fd__api.main:app --port 8013 &
-  python3 scripts/e2e_walkthrough.py --base http://127.0.0.1:8013
-不带 LLM KEY 时走确定性引擎（同样有效——闭环不强依赖 LLM）。
+链路：建项目→角色（要素+立场）→场次（conflict）→台词→版本快照→改→回滚→
+导出；底料：分镜→三形态提示词（角色一致性）；哲思：无哲思侧时
+降级 standalone（创作不阻断）。双账号隔离互查。
 """
 
 from __future__ import annotations
@@ -18,117 +13,120 @@ import sys
 import urllib.error
 import urllib.request
 
-# 六个经典问题域的生活语言问句（凑足投影阈值 ≥5 张可映射卡）
-ASKS = [
-    "我的选择真是我自己做的吗，还是一切早已注定",
-    "道德是对的还是只是我们的习惯",
-    "上帝存在吗",
-    "心灵能不能完全用物质解释",
-    "知识主要来自经验还是理性",
-    "今天的我和二十年后的我是同一个我吗",
-]
-POSITIONS = {  # 立场标签对齐 axis_map 实际词条（宁少勿错的保守映射表）
-    "free will": "compatibilism",
-    "meta-ethics": "moral realism",
-    "god": "atheism",
-    "mind": "physicalism",
-    "knowledge": "empiricism",
-    "identity": "biological view",
-}
-
 
 def call(base: str, token: str, method: str, path: str, body: dict | None = None):
     req = urllib.request.Request(
         base + path, method=method,
-        data=json.dumps(body).encode() if body else None,
+        data=json.dumps(body).encode() if body is not None else None,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     try:
         r = urllib.request.urlopen(req, timeout=60)
-        return r.status, json.loads(r.read())
+        raw = r.read()
+        return r.status, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b"{}")
 
 
-def run_account(base: str, token: str, who: str) -> list[str]:
-    cards = []
-    for text in ASKS:
-        code, out = call(base, token, "POST", "/api/v1/ask", {"text": text})
-        assert code == 200, f"{who} ask {code}: {out}"
-        qs = out.get("stance_questions", [])
-        assert qs, f"{who} ask 未命中立场问题: {text}"
-        q = qs[0]
-        qkey = next((k for k in POSITIONS if k in q["question"].lower()), None)
-        assert qkey, f"{who} 问题无法映射预设立场: {q['question']}"
-        code, card = call(base, token, "POST", "/api/v1/cards", {
-            "question": q["question"], "position": POSITIONS[qkey],
-            "reasons": f"{who} 的理由", "question_ref": q.get("question_ref"),
-        })
-        assert code == 201, f"{who} 建卡 {code}"
-        cards.append(card)
-    print(f"[{who}] 建卡 {len(cards)} 张")
+def first_id(obj: dict, *keys: str) -> str:
+    for k in keys:
+        v = obj.get(k)
+        if isinstance(v, dict) and "id" in v:
+            return str(v["id"])
+        if v is not None:
+            return str(v)
+    raise AssertionError(f"找不到 id: {str(obj)[:160]}")
 
-    # 辩：对第一张卡要最强反驳并回应
-    code, obj = call(base, token, "POST", "/api/v1/debate/strongest-objection",
-                     {"card_id": cards[0]["id"]})
-    assert code == 200, f"{who} 辩 {code}: {obj}"
-    assert obj.get("objection") and obj.get("citations"), f"{who} 反驳缺内容或引用"
-    code, r = call(base, token, "POST", f"/api/v1/cards/{cards[0]['id']}/response",
-                   {"my_response": "我的回应", "stability": "wavering"})
-    assert code == 200 and r["stability"] == "wavering"
-    print(f"[{who}] 辩闭环 ok（{len(obj['citations'])} 引用，engine={obj.get('engine')}）")
 
-    # 谱：投影（≥5 张可映射卡）
-    code, proj = call(base, token, "POST", "/api/v1/synthesis/project")
-    assert code == 201, f"{who} 投影 {code}: {proj}"
-    assert proj["axes"] and len(proj["neighbors"]) >= 3
-    print(f"[{who}] 投影 ok：六轴={ {k: round(v,1) for k,v in list(proj['axes'].items())[:2]} }… "
-          f"邻居1={proj['neighbors'][0].get('name_en')}")
+def run_account(base: str, token: str, who: str) -> str:
+    code, proj = call(base, token, "POST", "/api/v1/screenplay/projects",
+                      {"title": f"{who} 的戏", "logline": "旧账与旧友"})
+    assert code in (200, 201), f"{who} 建项目 {code}: {proj}"
+    pid = first_id(proj, "id", "project")
 
-    # 变更一张立场 → 年轮
-    code, changed = call(base, token, "POST", f"/api/v1/cards/{cards[0]['id']}/change",
-                         {"position": "other", "reasons": "想法变了"})
-    assert code == 200, f"{who} 变更 {code}"
-    code, annals = call(base, token, "GET", "/api/v1/cards/annals")
-    assert code == 200 and len(annals["results"]) >= 1
-    print(f"[{who}] 年轮 ok（{len(annals['results'])} 条）")
+    chars = []
+    for name, stance in [("沈青梧", "libertarianism"), ("顾行舟", "no free will")]:
+        code, c = call(base, token, "POST", f"/api/v1/screenplay/projects/{pid}/characters",
+                       {"name": name,
+                        "appearance": {"年龄感": "三十五岁上下", "着装": "月白旗袍", "画风": "水墨淡彩"},
+                        "stance": {"position": stance, "reasons": f"{who} 设定"}})
+        assert code in (200, 201), f"{who} 角色 {code}: {c}"
+        chars.append(first_id(c, "id", "character"))
+    print(f"[{who}] 项目+2 角色 ok")
 
-    # 张力簿：同题对立组合在此剧本里不必然出现，检测不炸+可查即过（宁缺毋滥语义）
-    code, det = call(base, token, "POST", "/api/v1/synthesis/detect-tensions")
-    assert code == 200, f"{who} 张力检测 {code}"
-    code, tl = call(base, token, "GET", "/api/v1/synthesis/tensions")
-    assert code == 200
-    print(f"[{who}] 张力簿 ok（{len(tl['results'])} 条，检测组合 {det.get('checked_pairs', '?')} 对）")
+    code, sc = call(base, token, "POST", f"/api/v1/screenplay/projects/{pid}/scenes",
+                    {"title": "茶馆对峙",
+                     "conflict": {"positions": ["要账", "赖账"], "source": "手工设定"}})
+    assert code in (200, 201), f"{who} 场次 {code}: {sc}"
+    sid = first_id(sc, "id", "scene")
+    for i, (sp, txt) in enumerate([
+        (chars[0], "把账拿出来。"), (chars[1], "什么账，我听不懂你在说什么。"),
+        (chars[0], "十年前腊月，城南当铺。"), (chars[1], "当票早烧了。"),
+        (chars[0], "烧得掉纸，烧不掉印。"), (chars[1], "那你就去告。"),
+    ]):
+        code, _ = call(base, token, "POST", f"/api/v1/screenplay/scenes/{sid}/lines",
+                       {"speaker_id": sp, "text": txt})
+        assert code in (200, 201), f"{who} 台词{i} {code}"
+    print(f"[{who}] 场次+6 台词 ok")
 
-    # 剧创结构卡：授权 → 取卡
-    code, _ = call(base, token, "POST", "/api/v1/grants",
-                   {"consumer": "juchuang", "card_kinds": ["stance", "tension"]})
-    assert code == 201
-    code, contract = call(base, token, "GET", "/api/v1/contract/cards?consumer=juchuang")
-    assert code == 200 and contract["contract_version"] == "1"
-    assert len(contract["cards"]) >= 5
-    print(f"[{who}] 结构卡 ok（{len(contract['cards'])} 张下发剧创）")
-    return cards
+    code, v1 = call(base, token, "POST", f"/api/v1/screenplay/projects/{pid}/versions", {})
+    assert code in (200, 201), f"{who} 存 v1 {code}: {v1}"
+    vid1 = first_id(v1, "id", "version")
+    code, lines = call(base, token, "GET", f"/api/v1/screenplay/scenes/{sid}/lines")
+    lst = lines if isinstance(lines, list) else lines.get("lines") or lines.get("results") or []
+    lid = first_id(lst[0], "id")
+    call(base, token, "PUT", f"/api/v1/screenplay/scenes/{sid}/lines/{lid}", {"text": "改过的台词"})
+    call(base, token, "POST", f"/api/v1/screenplay/projects/{pid}/versions", {})
+    code, _ = call(base, token, "POST", f"/api/v1/screenplay/projects/{pid}/restore/{vid1}", {})
+    assert code in (200, 201), f"{who} 回滚 {code}"
+    code, lines2 = call(base, token, "GET", f"/api/v1/screenplay/scenes/{sid}/lines")
+    lst2 = lines2 if isinstance(lines2, list) else lines2.get("lines") or []
+    assert any("把账拿出来" in str(x.get("text")) for x in lst2), f"{who} 回滚未复原"
+    print(f"[{who}] 版本快照/回滚 ok")
+
+    code, exp = call(base, token, "GET", f"/api/v1/screenplay/projects/{pid}/export")
+    assert code == 200 and "scenes" in json.dumps(exp), f"{who} 导出 {code}"
+    print(f"[{who}] 导出 ok")
+
+    code, sb = call(base, token, "POST", f"/api/v1/pipeline/storyboard/{sid}", {})
+    assert code in (200, 201), f"{who} 分镜 {code}: {sb}"
+    sbj = json.dumps(sb, ensure_ascii=False)
+    shots = (sb.get("shots") if isinstance(sb, dict) else None) or []
+    print(f"[{who}] 分镜 ok（{len(shots) if shots else sbj.count('idx')} 镜, engine={sb.get('engine') if isinstance(sb, dict) else '?'})")
+    code, ps = call(base, token, "POST", f"/api/v1/pipeline/prompts/{sid}", {})
+    assert code in (200, 201), f"{who} 提示词 {code}: {ps}"
+    refs = ps if isinstance(ps, list) else ps.get("promptsets") or ps.get("results") or []
+    assert refs, f"{who} 提示词引用为空: {ps}"
+    psj = ""
+    for ref in refs:
+        psid = ref.get("id") or ref.get("promptset_id")
+        code, payload = call(base, token, "GET", f"/api/v1/pipeline/prompts/{psid}")
+        assert code == 200, f"{who} 取提示词 {code}"
+        psj += json.dumps(payload, ensure_ascii=False)
+    assert ("月白旗袍" in psj) or ("character_id" in psj), f"{who} 角色一致性未注入"
+    print(f"[{who}] 三形态提示词 ok（{len(refs)} 形态，角色要素注入实证）")
+    return pid
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default="http://127.0.0.1:8013")
+    ap.add_argument("--base", default="http://127.0.0.1:8016")
     args = ap.parse_args()
 
     a = run_account(args.base, "tok-a", "alice")
     b = run_account(args.base, "tok-b", "bob")
 
-    # 隔离：bob 看不到 alice 的卡
-    code, out = call(args.base, "tok-b", "GET", "/api/v1/cards?status=active")
-    assert code == 200
-    a_ids = {c["id"] for c in a}
-    assert not a_ids & {c["id"] for c in out["results"]}, "隔离失败：bob 看到了 alice 的卡"
-    code, out = call(args.base, "tok-b", "GET", f"/api/v1/cards/{a[0]['id']}")
-    assert code == 404
-    print("[隔离] bob 看不到 alice 的卡（列表+单查双验）")
+    code, out = call(args.base, "tok-b", "GET", "/api/v1/screenplay/projects")
+    lst = out if isinstance(out, list) else out.get("projects") or out.get("results") or []
+    assert all(str(p.get("id")) != a for p in lst), "隔离失败"
+    print("[隔离] bob 看不到 alice 的项目")
 
-    print("\nE2E 双账号全链通过：问→辩→谱→年轮→张力→剧创卡。全链留痕见服务端 audit_log。")
+    code, st = call(args.base, "tok-a", "POST", "/api/v1/kernel/link", {})
+    assert code == 200, f"link {code}: {st}"
+    assert st.get("mode") == "standalone" and st.get("reason"), f"降级语义不对: {st}"
+    print(f"[降级] 无哲思侧 → standalone（reason={str(st.get('reason'))[:50]}…）")
+
+    print("\n剧创 E2E 双账号全链通过。")
     return 0
 
 

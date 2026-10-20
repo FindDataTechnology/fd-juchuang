@@ -1038,7 +1038,7 @@ export default function ScreenplayPanel() {
     setSceneBusy(true);
     setSceneNote(null);
     try {
-      const updated = await api.updateScene(sceneId, b);
+      const updated = await api.updateScene(selectedProjectId, sceneId, b);
       setScenes((s) =>
         s.status === "ready"
           ? { status: "ready", data: s.data.map((x) => (x.id === sceneId ? { ...x, ...updated } : x)) }

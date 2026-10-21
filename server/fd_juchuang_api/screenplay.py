@@ -10,6 +10,13 @@
 - 对手戏张力：场次 conflict {positions:[a,b], source}；两角色 stance 存在时
   tension-check 给本地文本差异版轴差（真轴差由哲思契约模块做，见 task 3.2）。
 
+交换格式（change juchuang-continuity-layer task 1.1-1.6）：
+- Fountain / FDX 的纯格式逻辑在 ``fountain.py``；本模块提供落库合并与
+  ``/projects/{pid}/export|import/{fountain,fdx}`` 端点。
+- 结构化层是唯一真源：导入按角色名 / 场次标题（或位置）匹配，已有
+  appearance/stance/conflict 与场次 id（分镜引用）不被覆盖；
+- 解析出的未识别元素原样进入响应 ``unrecognized``，不静默丢弃。
+
 鉴权：require_user（auth.py）。auth 依赖的 personal 底座若尚未交付（并行开发期），
 import 会失败——这里兜底一个同语义的 dev-token 校验，personal 落地后自动切真实现。
 """
@@ -23,8 +30,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from . import fountain
 
 # ---- 鉴权接线（见模块 docstring） ----
 
@@ -73,6 +82,8 @@ MIGRATIONS = [
         idx INTEGER NOT NULL,                      -- 场次序号，自动连续编号
         title TEXT NOT NULL,
         synopsis TEXT,
+        action TEXT,                               -- 动作/描述段落（Fountain Action 交换）
+        transition TEXT,                           -- 场次末尾转场（Fountain Transition 交换）
         conflict TEXT,                             -- JSON {positions:[a,b], source?}
         created_at TEXT NOT NULL
     );
@@ -82,7 +93,8 @@ MIGRATIONS = [
         scene_id INTEGER NOT NULL REFERENCES scenes(id) ON DELETE CASCADE,
         idx INTEGER NOT NULL,                      -- 台词序号，自动连续编号
         speaker_id INTEGER NOT NULL REFERENCES characters(id),
-        text TEXT NOT NULL
+        text TEXT NOT NULL,
+        parenthetical TEXT                         -- 括号说明（Fountain Parenthetical 交换）
     );
     CREATE INDEX IF NOT EXISTS idx_lines_scene ON lines(scene_id, idx);
     CREATE TABLE IF NOT EXISTS versions (
@@ -112,10 +124,26 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+# 既有库补列（CREATE TABLE IF NOT EXISTS 不会改旧表；幂等 ALTER，不碰 user_version）
+_EXTRA_COLUMNS: dict[str, dict[str, str]] = {
+    "scenes": {"action": "TEXT", "transition": "TEXT"},
+    "lines": {"parenthetical": "TEXT"},
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _EXTRA_COLUMNS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
 def migrate(conn: sqlite3.Connection) -> int:
     """幂等执行全部迁移脚本（DDL 自带 IF NOT EXISTS，可无限重放；不碰 user_version）。"""
     for ddl in MIGRATIONS:
         conn.executescript(ddl)
+    _ensure_columns(conn)
     conn.commit()
     return len(MIGRATIONS)
 
@@ -215,6 +243,8 @@ class SceneIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(min_length=1)
     synopsis: str | None = None
+    action: str | None = None
+    transition: str | None = None
     conflict: ConflictModel | None = None
 
 
@@ -222,6 +252,8 @@ class ScenePatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str | None = None
     synopsis: str | None = None
+    action: str | None = None
+    transition: str | None = None
     conflict: ConflictModel | None = None
     idx: int | None = Field(default=None, ge=1)
 
@@ -230,12 +262,14 @@ class LineIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     speaker_id: int
     text: str = Field(min_length=1)
+    parenthetical: str | None = None
 
 
 class LinePatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     speaker_id: int | None = None
     text: str | None = None
+    parenthetical: str | None = None
     idx: int | None = Field(default=None, ge=1)
 
 
@@ -256,12 +290,14 @@ def _character_dict(r: sqlite3.Row) -> dict:
 def _scene_dict(r: sqlite3.Row) -> dict:
     return {"id": r["id"], "project_id": r["project_id"], "idx": r["idx"],
             "title": r["title"], "synopsis": r["synopsis"],
+            "action": r["action"], "transition": r["transition"],
             "conflict": _loads(r["conflict"]), "created_at": r["created_at"]}
 
 
 def _line_dict(r: sqlite3.Row) -> dict:
     return {"id": r["id"], "scene_id": r["scene_id"], "idx": r["idx"],
-            "speaker_id": r["speaker_id"], "text": r["text"]}
+            "speaker_id": r["speaker_id"], "text": r["text"],
+            "parenthetical": r["parenthetical"]}
 
 
 def _version_dict(r: sqlite3.Row, with_snapshot: bool = False) -> dict:
@@ -575,9 +611,10 @@ def create_scene(pid: int, body: SceneIn, user_id: str = Depends(require_user)) 
         _need_project(conn, user_id, pid)
         idx = _max_idx(conn, "scenes", "project_id", pid) + 1
         cur = conn.execute(
-            "INSERT INTO scenes (id, project_id, idx, title, synopsis, conflict, created_at)"
-            " VALUES (NULL,?,?,?,?,?,?)",
-            (pid, idx, body.title.strip(), body.synopsis,
+            "INSERT INTO scenes (id, project_id, idx, title, synopsis, action,"
+            " transition, conflict, created_at) VALUES (NULL,?,?,?,?,?,?,?,?)",
+            (pid, idx, body.title.strip(), body.synopsis, body.action,
+             body.transition,
              _dumps(body.conflict.model_dump() if body.conflict else None), now()),
         )
         sid = int(cur.lastrowid)
@@ -621,6 +658,12 @@ def patch_scene(pid: int, sid: int, body: ScenePatch,
         if "synopsis" in body.model_fields_set:
             sets.append("synopsis=?")
             vals.append(body.synopsis)
+        if "action" in body.model_fields_set:
+            sets.append("action=?")
+            vals.append(body.action)
+        if "transition" in body.model_fields_set:
+            sets.append("transition=?")
+            vals.append(body.transition)
         if "conflict" in body.model_fields_set:
             sets.append("conflict=?")
             vals.append(_dumps(body.conflict.model_dump() if body.conflict else None))
@@ -676,8 +719,9 @@ def create_line(sid: int, body: LineIn, user_id: str = Depends(require_user)) ->
         _check_speaker(conn, proj["id"], body.speaker_id)
         idx = _max_idx(conn, "lines", "scene_id", sid) + 1
         cur = conn.execute(
-            "INSERT INTO lines (id, scene_id, idx, speaker_id, text) VALUES (NULL,?,?,?,?)",
-            (sid, idx, body.speaker_id, body.text.strip()),
+            "INSERT INTO lines (id, scene_id, idx, speaker_id, text, parenthetical)"
+            " VALUES (NULL,?,?,?,?,?)",
+            (sid, idx, body.speaker_id, body.text.strip(), body.parenthetical),
         )
         lid = int(cur.lastrowid)
         conn.commit()
@@ -714,6 +758,9 @@ def patch_line(sid: int, lid: int, body: LinePatch,
         if "text" in body.model_fields_set and body.text is not None:
             sets.append("text=?")
             vals.append(body.text.strip())
+        if "parenthetical" in body.model_fields_set:
+            sets.append("parenthetical=?")
+            vals.append(body.parenthetical)
         if sets:
             vals.append(lid)
             conn.execute(f"UPDATE lines SET {', '.join(sets)} WHERE id=?", vals)
@@ -818,16 +865,18 @@ def restore_version(pid: int, vid: int, user_id: str = Depends(require_user)) ->
                 )
             for s in scenes:
                 conn.execute(
-                    "INSERT INTO scenes (id, project_id, idx, title, synopsis, conflict,"
-                    " created_at) VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO scenes (id, project_id, idx, title, synopsis, action,"
+                    " transition, conflict, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                     (s["id"], pid, s["idx"], s["title"], s.get("synopsis"),
+                     s.get("action"), s.get("transition"),
                      _dumps(s.get("conflict")), s["created_at"]),
                 )
                 for ln in s.get("lines", []):
                     conn.execute(
-                        "INSERT INTO lines (id, scene_id, idx, speaker_id, text)"
-                        " VALUES (?,?,?,?,?)",
-                        (ln["id"], s["id"], ln["idx"], ln["speaker_id"], ln["text"]),
+                        "INSERT INTO lines (id, scene_id, idx, speaker_id, text,"
+                        " parenthetical) VALUES (?,?,?,?,?,?)",
+                        (ln["id"], s["id"], ln["idx"], ln["speaker_id"], ln["text"],
+                         ln.get("parenthetical")),
                     )
             new_snap = _snapshot(conn, pid, "restore", restored_from=vid)
             cur = conn.execute(
@@ -855,6 +904,295 @@ def export_project(pid: int, user_id: str = Depends(require_user)) -> dict:
     try:
         _need_project(conn, user_id, pid)
         return _project_tree(conn, pid)
+    finally:
+        conn.close()
+
+
+# ==== 交换格式：Fountain / FDX（change juchuang-continuity-layer task 1.1-1.6） ====
+
+
+class ImportDocumentIn(BaseModel):
+    """导入请求体：``text`` 为 Fountain 文本或 FDX XML。"""
+
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1)
+    mode: str = Field(default="merge", pattern="^(merge|replace)$")
+
+
+def _normalize_scene_title(value: str | None) -> str:
+    return " ".join((value or "").split()).casefold()
+
+
+def _storyboard_ref_count(conn: sqlite3.Connection, pid: int) -> int:
+    """分镜引用计数（storyboard 由 pipeline 模块建表，可能尚未存在）。"""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='storyboard'"
+    ).fetchone()
+    if not exists:
+        return 0
+    row = conn.execute(
+        "SELECT COUNT(*) FROM storyboard sb JOIN scenes s ON sb.scene_id=s.id"
+        " WHERE s.project_id=?",
+        (pid,),
+    ).fetchone()
+    return int(row[0])
+
+
+def _resolve_import_character(conn: sqlite3.Connection, pid: int, name: str,
+                              cache: dict[str, int], created: list[str]) -> int:
+    """按名匹配角色；不存在则建卡。已有角色卡（appearance/stance）绝不覆盖。"""
+    key = name.strip()
+    if key in cache:
+        return cache[key]
+    row = conn.execute(
+        "SELECT id FROM characters WHERE project_id=? AND name=? COLLATE NOCASE",
+        (pid, key),
+    ).fetchone()
+    if row is not None:
+        cache[key] = int(row["id"])
+        return int(row["id"])
+    cur = conn.execute(
+        "INSERT INTO characters (id, project_id, name, appearance, stance, created_at)"
+        " VALUES (NULL,?,?,?,?,?)",
+        (pid, key,
+         _dumps({"来源": "交换格式导入", "设定": "待补"}), None, now()),
+    )
+    cid = int(cur.lastrowid)
+    cache[key] = cid
+    created.append(key)
+    return cid
+
+
+def _merge_parsed_document(conn: sqlite3.Connection, pid: int, parsed: dict,
+                           mode: str, fmt: str) -> dict:
+    """把 Fountain/FDX 解析结果合并进项目。
+
+    合并语义：
+    - 角色按名匹配，已有角色卡的 appearance/stance 不覆盖；
+    - 场次按标题匹配（同标题按出现顺序），否则按位置；匹配上的场次保留 id、
+      conflict、created_at，因此 pipeline.storyboard 的分镜引用仍然有效；
+    - 解析格式不承载的字段（FDX 无 synopsis）不更新，保留结构化层原值；
+    - 场次台词整体替换为导入文本（台词无独立元数据）。
+    """
+    capabilities = set(parsed.get("capabilities") or [])
+    warnings = list(parsed.get("warnings") or [])
+    title_page = parsed.get("title_page") or {}
+
+    title = (title_page.get("title") or "").strip()
+    if title:
+        conn.execute("UPDATE projects SET title=? WHERE id=?", (title, pid))
+    if "logline" in title_page:
+        logline = (title_page.get("logline") or "").strip() or None
+        conn.execute("UPDATE projects SET logline=? WHERE id=?", (logline, pid))
+
+    metadata = {
+        "stances": int(conn.execute(
+            "SELECT COUNT(*) FROM characters WHERE project_id=? AND stance IS NOT NULL",
+            (pid,)).fetchone()[0]),
+        "appearances": int(conn.execute(
+            "SELECT COUNT(*) FROM characters WHERE project_id=?"
+            " AND appearance IS NOT NULL AND appearance<>'{}'", (pid,)).fetchone()[0]),
+        "conflicts": int(conn.execute(
+            "SELECT COUNT(*) FROM scenes WHERE project_id=? AND conflict IS NOT NULL",
+            (pid,)).fetchone()[0]),
+        "storyboard_refs": _storyboard_ref_count(conn, pid),
+    }
+
+    existing = [dict(row) for row in conn.execute(
+        "SELECT * FROM scenes WHERE project_id=? ORDER BY idx", (pid,)
+    ).fetchall()]
+    if mode == "replace":
+        metadata["conflicts_dropped"] = metadata["conflicts"]
+        metadata["storyboard_refs_dropped"] = metadata["storyboard_refs"]
+        warnings.append({
+            "field": "scenes.conflict/storyboard",
+            "reason": "replace 模式删除并重建场次，场次张力标注与分镜引用无法保留",
+        })
+        conn.execute("DELETE FROM scenes WHERE project_id=?", (pid,))
+        existing = []
+
+    by_title: dict[str, list[dict]] = {}
+    for row in existing:
+        by_title.setdefault(_normalize_scene_title(row["title"]), []).append(row)
+
+    used_ids: set[int] = set()
+    character_cache: dict[str, int] = {}
+    characters_created: list[str] = []
+    scenes_created: list[dict] = []
+    scenes_updated: list[dict] = []
+    next_idx = max((int(row["idx"]) for row in existing), default=0) + 1
+
+    for position, parsed_scene in enumerate(parsed.get("scenes") or []):
+        heading = (parsed_scene.get("heading") or "").strip()
+        match = None
+        for candidate in by_title.get(_normalize_scene_title(heading), []):
+            if candidate["id"] not in used_ids:
+                match = candidate
+                break
+        if match is None:
+            # 位置兜底：标题被外部工具改写时仍尽量保住场次 id 与元数据
+            for candidate in existing:
+                if candidate["id"] not in used_ids and int(candidate["idx"]) == position + 1:
+                    match = candidate
+                    break
+
+        if match is not None:
+            used_ids.add(int(match["id"]))
+            sets = ["title=?"]
+            values: list[Any] = [heading]
+            if "synopsis" in capabilities:
+                sets.append("synopsis=?")
+                values.append(parsed_scene.get("synopsis"))
+            if "action" in capabilities:
+                sets.append("action=?")
+                values.append(parsed_scene.get("action"))
+            if "transition" in capabilities:
+                sets.append("transition=?")
+                values.append(parsed_scene.get("transition"))
+            values.append(int(match["id"]))
+            conn.execute(f"UPDATE scenes SET {', '.join(sets)} WHERE id=?", values)
+            scene_id = int(match["id"])
+            scenes_updated.append({"id": scene_id, "title": heading})
+        else:
+            cur = conn.execute(
+                "INSERT INTO scenes (id, project_id, idx, title, synopsis, action,"
+                " transition, conflict, created_at) VALUES (NULL,?,?,?,?,?,?,?,?)",
+                (pid, next_idx, heading,
+                 parsed_scene.get("synopsis") if "synopsis" in capabilities else None,
+                 parsed_scene.get("action") if "action" in capabilities else None,
+                 parsed_scene.get("transition") if "transition" in capabilities else None,
+                 None, now()),
+            )
+            scene_id = int(cur.lastrowid)
+            next_idx += 1
+            scenes_created.append({"id": scene_id, "title": heading})
+
+        conn.execute("DELETE FROM lines WHERE scene_id=?", (scene_id,))
+        line_idx = 0
+        for parsed_line in parsed_scene.get("lines") or []:
+            speaker = (parsed_line.get("speaker") or "").strip()
+            text = (parsed_line.get("text") or "").strip()
+            if not speaker or not text:
+                warnings.append({
+                    "field": "lines",
+                    "reason": "缺说话人或文本的台词已跳过",
+                    "scene": heading,
+                })
+                continue
+            line_idx += 1
+            speaker_id = _resolve_import_character(
+                conn, pid, speaker, character_cache, characters_created)
+            conn.execute(
+                "INSERT INTO lines (id, scene_id, idx, speaker_id, text, parenthetical)"
+                " VALUES (NULL,?,?,?,?,?)",
+                (scene_id, line_idx, speaker_id, text,
+                 parsed_line.get("parenthetical")),
+            )
+
+    kept = [row for row in existing if int(row["id"]) not in used_ids]
+    conn.commit()
+    return {
+        "format": fmt,
+        "mode": mode,
+        "project_id": pid,
+        "title_page": title_page,
+        "scenes": {
+            "total": len(parsed.get("scenes") or []),
+            "created": scenes_created,
+            "updated": scenes_updated,
+            "kept": [{"id": row["id"], "title": row["title"]} for row in kept],
+        },
+        "characters": {
+            "created": characters_created,
+            "matched": sorted(set(character_cache) - set(characters_created)),
+        },
+        "metadata_preserved": metadata,
+        "unrecognized": parsed.get("unrecognized") or [],
+        "unrecognized_summary": parsed.get("unrecognized_summary") or {},
+        "warnings": warnings,
+    }
+
+
+@router.get("/formats/fountain/mapping")
+def fountain_field_mapping() -> dict:
+    """task 1.1 映射表：可交换字段 / Fountain 不承载字段 / Fountain 独有元素。"""
+    return fountain.FountainFieldMapping.as_dict()
+
+
+@router.get("/projects/{pid}/export/fountain")
+def export_fountain(pid: int,
+                    fmt: str = Query(default="text", alias="format",
+                                     pattern="^(text|json)$"),
+                    user_id: str = Depends(require_user)) -> Any:
+    """导出 Fountain。``format=json`` 时同时返回有损警告与映射表。"""
+    conn = _db()
+    try:
+        _need_project(conn, user_id, pid)
+        result = fountain.serialize_with_report(_project_tree(conn, pid))
+    finally:
+        conn.close()
+    if fmt == "json":
+        return result.as_dict()
+    return Response(
+        content=result.text,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="project-{pid}.fountain"'
+        },
+    )
+
+
+@router.post("/projects/{pid}/import/fountain")
+def import_fountain(pid: int, body: ImportDocumentIn,
+                    user_id: str = Depends(require_user)) -> dict:
+    """解析 Fountain 并合并进项目；未识别元素在报告中列出。"""
+    conn = _db()
+    try:
+        _need_project(conn, user_id, pid)
+        try:
+            parsed = fountain.parse_from_fountain(body.text)
+        except ValueError as exc:  # 解析器目前不抛；保留统一 422 语义
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _merge_parsed_document(conn, pid, parsed, body.mode, "fountain")
+    finally:
+        conn.close()
+
+
+@router.get("/projects/{pid}/export/fdx")
+def export_fdx(pid: int,
+               fmt: str = Query(default="xml", alias="format",
+                                pattern="^(xml|json)$"),
+               user_id: str = Depends(require_user)) -> Any:
+    """导出 Final Draft XML。``format=json`` 时同时返回有损字段警告。"""
+    conn = _db()
+    try:
+        _need_project(conn, user_id, pid)
+        result = fountain.serialize_to_fdx(_project_tree(conn, pid))
+    finally:
+        conn.close()
+    if fmt == "json":
+        return result.as_dict()
+    return Response(
+        content=result.text,
+        media_type="application/xml; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="project-{pid}.fdx"'
+        },
+    )
+
+
+@router.post("/projects/{pid}/import/fdx")
+def import_fdx(pid: int, body: ImportDocumentIn,
+               user_id: str = Depends(require_user)) -> dict:
+    """解析 FDX 并合并进项目；无法映射的段落类型在报告中列出。"""
+    conn = _db()
+    try:
+        _need_project(conn, user_id, pid)
+        try:
+            parsed = fountain.parse_from_fdx(body.text)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _merge_parsed_document(conn, pid, parsed, body.mode, "fdx")
     finally:
         conn.close()
 

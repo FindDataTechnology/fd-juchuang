@@ -7,7 +7,9 @@ import {
   ApiUnavailableError,
   asList,
   conflictText,
+  parseRefs,
   setToken,
+  shotPatch,
   stanceText,
   TOKEN_KEY,
   zhesiSource,
@@ -80,12 +82,32 @@ describe("URL 拼装与 token 头", () => {
     const fetchMock = vi.fn(async () => okJson({}));
     vi.stubGlobal("fetch", fetchMock);
 
-    await api.updateShot("sb 1", 2, { idx: 2, shot_size: "特写", visual: "v", action: "a", line: "l", duration: 3 });
+    const patch = shotPatch({
+      idx: 2,
+      shot_size: "特写",
+      visual: "v",
+      action: "a",
+      line: "l",
+      duration: 3,
+      staging: "俯视图：对坐",
+      keyframe: "关键帧：烛火",
+      model_sheet_refs: ["101"],
+      art_bible_refs: ["77"],
+    });
+    await api.updateShot("sb 1", 2, patch);
 
     const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
     expect(String(url)).toBe(`http://localhost/api/v1/pipeline/storyboard/sb%201/2`);
     expect(init.method).toBe("PUT");
-    expect(JSON.parse(String(init.body))).toMatchObject({ idx: 2, shot_size: "特写" });
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      shot_size: "特写",
+      line_text: "l",
+      duration_sec: 3,
+      staging: "俯视图：对坐",
+      keyframe: "关键帧：烛火",
+      model_sheet_refs: ["101"],
+      art_bible_refs: ["77"],
+    });
   });
 
   it("DELETE 台词与路径参数 encodeURIComponent", async () => {
@@ -198,5 +220,46 @@ describe("契约辅助函数", () => {
     expect(conflictText("渡与不渡")).toBe("渡与不渡");
     expect(conflictText({ a: "自由", b: "决定", source: "zhesi" })).toBe("自由 ↔ 决定");
     expect(conflictText({ description: "留下的理由" })).toBe("留下的理由");
+  });
+
+  it("shotPatch：视图字段映射为后端契约，扩展字段支持清空", () => {
+    const patch = shotPatch({
+      idx: 3,
+      shot_size: "近景",
+      visual: "窗前",
+      action: "回头",
+      line: "你回来了",
+      duration: "3.5",
+      staging: "俯视图：两人对坐",
+      keyframe: "关键帧：烛火",
+      model_sheet_refs: ["101", "102"],
+      art_bible_refs: ["77", "p1"],
+    });
+    expect(patch).toEqual({
+      shot_size: "近景",
+      visual: "窗前",
+      action: "回头",
+      line_text: "你回来了",
+      duration_sec: 3.5,
+      staging: "俯视图：两人对坐",
+      keyframe: "关键帧：烛火",
+      model_sheet_refs: ["101", "102"],
+      art_bible_refs: ["77", "p1"],
+    });
+    // 空白/缺省的新字段 → null / []（可清空）；空旧字段不下发（避免 422）
+    expect(shotPatch({ idx: 0 })).toEqual({
+      staging: null,
+      keyframe: null,
+      model_sheet_refs: [],
+      art_bible_refs: [],
+    });
+    // 非法时长不下发
+    expect(shotPatch({ idx: 1, duration: "abc" })).not.toHaveProperty("duration_sec");
+    expect(shotPatch({ idx: 1, duration: 0 })).not.toHaveProperty("duration_sec");
+  });
+
+  it("parseRefs：逗号/中文逗号/空白分隔，去空去重", () => {
+    expect(parseRefs("101, 102，102  p1")).toEqual(["101", "102", "p1"]);
+    expect(parseRefs("  ")).toEqual([]);
   });
 });

@@ -4,7 +4,9 @@ import { useTranslation } from "react-i18next";
 import {
   api,
   downloadJson,
+  parseRefs,
   PROMPT_FORMS,
+  shotPatch,
   type Project,
   type PromptForm,
   type Scene,
@@ -28,7 +30,19 @@ import {
 
 /** 防御式镜头行：兼容常见键名（shot_size/scale/景别 等），统一为规范字段。 */
 export function normalizeShot(raw: unknown, i: number): StoryboardShot {
-  if (!raw || typeof raw !== "object") return { idx: i, shot_size: "", visual: "", action: "", line: "", duration: "" };
+  if (!raw || typeof raw !== "object")
+    return {
+      idx: i,
+      shot_size: "",
+      visual: "",
+      action: "",
+      line: "",
+      duration: "",
+      staging: null,
+      keyframe: null,
+      model_sheet_refs: [],
+      art_bible_refs: [],
+    };
   const o = raw as Record<string, unknown>;
   const pick = (...keys: string[]): string => {
     for (const k of keys) {
@@ -38,6 +52,8 @@ export function normalizeShot(raw: unknown, i: number): StoryboardShot {
     }
     return "";
   };
+  const refs = (v: unknown): string[] =>
+    Array.isArray(v) ? v.map((x) => String(x)).filter(Boolean) : [];
   const dur = o.duration ?? o.seconds ?? o.length;
   return {
     idx: typeof o.idx === "number" ? o.idx : i,
@@ -46,6 +62,10 @@ export function normalizeShot(raw: unknown, i: number): StoryboardShot {
     action: pick("action", "动作"),
     line: pick("line", "dialogue", "text", "台词"),
     duration: typeof dur === "number" || typeof dur === "string" ? dur : "",
+    staging: pick("staging", "走位") || null,
+    keyframe: pick("keyframe", "关键帧") || null,
+    model_sheet_refs: refs(o.model_sheet_refs),
+    art_bible_refs: refs(o.art_bible_refs),
   };
 }
 
@@ -164,6 +184,10 @@ export function PipelineView({
                         <th className="py-2 pr-2 font-normal">{t("workbench.pipeline.action")}</th>
                         <th className="py-2 pr-2 font-normal">{t("workbench.pipeline.line")}</th>
                         <th className="py-2 pr-2 font-normal">{t("workbench.pipeline.duration")}</th>
+                        <th className="py-2 pr-2 font-normal">{t("workbench.pipeline.staging")}</th>
+                        <th className="py-2 pr-2 font-normal">{t("workbench.pipeline.keyframe")}</th>
+                        <th className="py-2 pr-2 font-normal">{t("workbench.pipeline.modelSheetRefs")}</th>
+                        <th className="py-2 pr-2 font-normal">{t("workbench.pipeline.artBibleRefs")}</th>
                         <th className="py-2 font-normal" />
                       </tr>
                     </thead>
@@ -262,6 +286,11 @@ function ShotRow({
 }) {
   const { t } = useTranslation();
   const [draft, setDraft] = useState<StoryboardShot>(shot);
+  // 引用框保留原始输入文本（否则输入逗号会被 split/join 吞掉）
+  const [modelSheetText, setModelSheetText] = useState(
+    (shot.model_sheet_refs ?? []).join(", "),
+  );
+  const [artBibleText, setArtBibleText] = useState((shot.art_bible_refs ?? []).join(", "));
   const set = (patch: Partial<StoryboardShot>) => setDraft((d) => ({ ...d, ...patch }));
 
   return (
@@ -305,6 +334,46 @@ function ShotRow({
           onChange={(e) => set({ duration: e.target.value })}
           className={`${inputText} w-16`}
           aria-label={t("workbench.pipeline.duration")}
+        />
+      </td>
+      <td className="py-2 pr-2">
+        <input
+          value={draft.staging ?? ""}
+          onChange={(e) => set({ staging: e.target.value })}
+          className={`${inputText} min-w-56`}
+          aria-label={t("workbench.pipeline.staging")}
+        />
+      </td>
+      <td className="py-2 pr-2">
+        <input
+          value={draft.keyframe ?? ""}
+          onChange={(e) => set({ keyframe: e.target.value })}
+          className={`${inputText} min-w-56`}
+          aria-label={t("workbench.pipeline.keyframe")}
+        />
+      </td>
+      <td className="py-2 pr-2">
+        <input
+          value={modelSheetText}
+          onChange={(e) => {
+            setModelSheetText(e.target.value);
+            set({ model_sheet_refs: parseRefs(e.target.value) });
+          }}
+          className={`${inputText} min-w-28`}
+          placeholder={t("workbench.pipeline.refsHint")}
+          aria-label={t("workbench.pipeline.modelSheetRefs")}
+        />
+      </td>
+      <td className="py-2 pr-2">
+        <input
+          value={artBibleText}
+          onChange={(e) => {
+            setArtBibleText(e.target.value);
+            set({ art_bible_refs: parseRefs(e.target.value) });
+          }}
+          className={`${inputText} min-w-28`}
+          placeholder={t("workbench.pipeline.refsHint")}
+          aria-label={t("workbench.pipeline.artBibleRefs")}
         />
       </td>
       <td className="py-2">
@@ -399,7 +468,9 @@ export default function PipelinePanel() {
     setShotBusyIdx(shot.idx);
     setSbNote(null);
     try {
-      await api.updateShot(sb.id, shot.idx, shot);
+      // 视图字段（line/duration）→ 后端契约字段（line_text/duration_sec），
+      // 同时带上 staging/keyframe/model_sheet_refs/art_bible_refs。
+      await api.updateShot(sb.id, shot.idx, shotPatch(shot));
       setStoryboard({
         status: "ready",
         data: { ...sb, shots: (sb.shots ?? []).map((s) => (s.idx === shot.idx ? shot : s)) },

@@ -1,12 +1,13 @@
-/** 工作台：剧本 / 哲思 / 底料 三 tab（juchuang-script-studio web 任务）。 */
+/** 工作台：剧本 / 哲思 / 底料 / 质量门 四 tab（juchuang-script-studio web 任务）。 */
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import ScreenplayPanel from "./workbench/ScreenplayPanel";
 import KernelPanel from "./workbench/KernelPanel";
 import PipelinePanel from "./workbench/PipelinePanel";
+import QualityPanel from "./workbench/QualityPanel";
 
-type Tab = "screenplay" | "kernel" | "pipeline";
-const TABS: readonly Tab[] = ["screenplay", "kernel", "pipeline"];
+type Tab = "screenplay" | "kernel" | "pipeline" | "quality";
+const TABS: readonly Tab[] = ["screenplay", "kernel", "pipeline", "quality"];
 
 export default function Workbench() {
   const { t } = useTranslation();
@@ -40,6 +41,7 @@ export default function Workbench() {
         {tab === "screenplay" ? <ScreenplayPanel /> : null}
         {tab === "kernel" ? <KernelPanel /> : null}
         {tab === "pipeline" ? <PipelinePanel /> : null}
+        {tab === "quality" ? <QualityPanel /> : null}
       </div>
     </main>
   );

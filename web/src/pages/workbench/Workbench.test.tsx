@@ -7,11 +7,12 @@
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import "../../i18n";
-import { api, ApiUnavailableError, type Project, type Character, type Scene, type Line, type VersionEntry, type Storyboard, type KernelStatus } from "../../api/client";
+import { api, ApiUnavailableError, type Project, type Character, type Scene, type Line, type VersionEntry, type Storyboard, type KernelStatus, type QualityAssessment, type QualityDimensionScore, type QualityProblem } from "../../api/client";
 import { mapApiError } from "../../api/state";
 import { ScreenplayView } from "./ScreenplayPanel";
 import { KernelView } from "./KernelPanel";
-import { PipelineView } from "./PipelinePanel";
+import { normalizeShot, PipelineView } from "./PipelinePanel";
+import { QualityView } from "./QualityPanel";
 
 const noop = () => {};
 
@@ -276,8 +277,30 @@ describe("就绪态关键渲染", () => {
       id: "sb1",
       scene_id: "s1",
       shots: [
-        { idx: 0, shot_size: "特写", visual: "雨夜窗前", action: "抬头", line: "你回来了", duration: 3 },
-        { idx: 1, shot_size: "全景", visual: "空码头", action: "沉默", line: "（无）", duration: 5 },
+        {
+          idx: 0,
+          shot_size: "特写",
+          visual: "雨夜窗前",
+          action: "抬头",
+          line: "你回来了",
+          duration: 3,
+          staging: "俯视图：两人隔桌对坐",
+          keyframe: "关键帧：雨滴停在窗玻璃上",
+          model_sheet_refs: ["c1"],
+          art_bible_refs: ["s1"],
+        },
+        {
+          idx: 1,
+          shot_size: "全景",
+          visual: "空码头",
+          action: "沉默",
+          line: "（无）",
+          duration: 5,
+          staging: null,
+          keyframe: null,
+          model_sheet_refs: [],
+          art_bible_refs: [],
+        },
       ],
     };
     const html = renderToString(
@@ -310,10 +333,273 @@ describe("就绪态关键渲染", () => {
     expect(html).toContain("景别");
     expect(html).toContain("画面");
     expect(html).toContain("时长(秒)");
+    expect(html).toContain("走位");
+    expect(html).toContain("关键帧");
+    expect(html).toContain("角色 model sheet");
+    expect(html).toContain("art bible 引用");
     expect(html).toContain("特写");
-    expect(html).toContain("雨夜窗前的中年男人"); // 提示词 JSON 预览
+    // 新字段值进入可编辑输入框
+    expect(html).toContain("俯视图：两人隔桌对坐");
+    expect(html).toContain("关键帧：雨滴停在窗玻璃上");
+    expect(html).toContain("c1");
+    // 提示词 JSON 预览与下载
+    expect(html).toContain("雨夜窗前的中年男人");
     expect(html).toContain("下载 JSON");
     expect(html).toContain("视频"); // 三形态 tab
     expect(html).toContain("文本");
+  });
+
+  it("normalizeShot：保留扩展字段并对旧行/脏值兜底", () => {
+    const shot = normalizeShot(
+      {
+        idx: 2,
+        shot_size: "中景",
+        visual: "画面",
+        action: "动作",
+        staging: "俯视图：对坐",
+        keyframe: "关键帧：烛火",
+        model_sheet_refs: ["101", 102],
+        art_bible_refs: ["77"],
+      },
+      0,
+    );
+    expect(shot).toMatchObject({
+      idx: 2,
+      staging: "俯视图：对坐",
+      keyframe: "关键帧：烛火",
+      model_sheet_refs: ["101", "102"],
+      art_bible_refs: ["77"],
+    });
+    // 旧版行（无扩展字段）→ null / []
+    expect(normalizeShot({ idx: 1, visual: "旧画面" }, 0)).toMatchObject({
+      staging: null,
+      keyframe: null,
+      model_sheet_refs: [],
+      art_bible_refs: [],
+    });
+    // 非对象行也给出完整骨架
+    expect(normalizeShot(null, 3)).toMatchObject({
+      idx: 3,
+      staging: null,
+      model_sheet_refs: [],
+      art_bible_refs: [],
+    });
+  });
+});
+
+// ---------------------------------------------------------------- 质量门（4.1-4.4）
+
+describe("质量门：六维分列 + 可展开问题清单 + 红线阻断", () => {
+  const project: Project = { id: "p1", title: "北渡" };
+
+  const dimension = (
+    key: string,
+    label: string,
+    score: number | null,
+    overrides: Partial<QualityDimensionScore> = {},
+  ): QualityDimensionScore => ({
+    dimension: key,
+    label,
+    score,
+    available: score !== null,
+    reason: null,
+    weight: 1 / 6,
+    rules_applied: [`${key}.rule`],
+    rule_results: [
+      {
+        rule_id: `${key}.rule`,
+        title: `${label}规则`,
+        status: score !== null ? "ok" : "skipped",
+        checked: 3,
+        problem_count: 0,
+        reason: null,
+      },
+    ],
+    problems: [],
+    problem_count: 0,
+    severity_counts: { warning: 0, error: 0, critical: 0 },
+    ...overrides,
+  });
+
+  const continuityProblem: QualityProblem = {
+    rule_id: "continuity.knowledge_timeline",
+    dimension: "continuity",
+    severity: "error",
+    message: "林务实 在第3集尚未获知「密钥」（第5集才获知），台词提前使用",
+    location: {
+      scene_id: 1,
+      line_id: 6,
+      line_idx: 1,
+      character: "林务实",
+      scope: "line",
+      offset: 0,
+      excerpt: "密钥",
+    },
+    evidence: "台账事实 #12：陈守拙|拥有|密钥；第5集才获知，当前第3集",
+    ledger_refs: [
+      {
+        kind: "fact",
+        fact_id: 12,
+        signature: "陈守拙|拥有|密钥",
+        violation_type: "knowledge_violation",
+        detail: {},
+      },
+    ],
+    penalty: 1.5,
+  };
+
+  const readyAssessment: QualityAssessment = {
+    id: 9,
+    project_id: "p1",
+    episode_id: "ep-3",
+    episode: 3,
+    dimension_order: [
+      "rhythm",
+      "emotional_payoff",
+      "dialogue",
+      "format",
+      "continuity",
+      "compliance",
+    ],
+    dimensions: {
+      rhythm: dimension("rhythm", "节奏", 9.8),
+      emotional_payoff: dimension("emotional_payoff", "爽点/情绪回报", 9.5),
+      dialogue: dimension("dialogue", "对白", 10),
+      format: dimension("format", "格式", 10),
+      continuity: dimension("continuity", "连续性", 8.5, {
+        problems: [continuityProblem],
+        problem_count: 1,
+        severity_counts: { warning: 0, error: 1, critical: 0 },
+        rule_results: [
+          {
+            rule_id: "continuity.knowledge_timeline",
+            title: "角色知识时点",
+            status: "violated",
+            checked: 12,
+            problem_count: 1,
+            reason: null,
+          },
+        ],
+      }),
+      compliance: dimension("compliance", "合规", 10),
+    },
+    overall_score: 9.4,
+    overall_formula: "weighted_average(available_dimensions)",
+    blocked: false,
+    redline_hit: false,
+    block_reasons: [],
+    violation_details: [],
+    stats: {},
+    created_at: "2026-10-21T00:00:00",
+  };
+
+  it("六维分列展示，连续性分数展开后带定位/依据/台账事实引用", () => {
+    const html = renderToString(
+      <QualityView
+        projects={{ status: "ready", data: [project] }}
+        selectedProjectId="p1"
+        onSelectProject={noop}
+        episode="3"
+        onEpisodeChange={noop}
+        onAssess={noop}
+        assessBusy={false}
+        assessNote={null}
+        assessment={{ status: "ready", data: readyAssessment }}
+      />,
+    );
+
+    // 六个维度各自成卡，而不是只给一个总分
+    for (const label of ["节奏", "爽点/情绪回报", "对白", "格式", "连续性", "合规"]) {
+      expect(html).toContain(label);
+    }
+    // 可展开的问题清单（details/summary）承载支撑问题而非仅数字
+    expect(html).toContain("<details");
+    expect(html).toContain("展开支撑问题");
+    expect(html).toContain("林务实 在第3集尚未获知");
+    expect(html).toContain("第 #1 场 · 第 #1 行 · 林务实");
+    expect(html).toContain("台账事实 #12：陈守拙|拥有|密钥");
+    expect(html).toContain("依据");
+    // 规则项与检查规模也在展开区
+    expect(html).toContain("检查 12 项");
+    expect(html).toContain("加权总分");
+  });
+
+  it("命中合规红线：阻断横幅逐条列出命中项", () => {
+    const blocked: QualityAssessment = {
+      ...readyAssessment,
+      blocked: true,
+      redline_hit: true,
+      block_reasons: ["compliance.violence_instruction: 命中合规红线「暴力操作细节」：制造炸弹"],
+      violation_details: [
+        {
+          rule_id: "compliance.violence_instruction",
+          severity: "critical",
+          message: "命中合规红线「暴力操作细节」：制造炸弹",
+          location: {
+            scene_id: 2,
+            line_id: 8,
+            line_idx: 1,
+            character: "陈守拙",
+            scope: "line",
+          },
+          evidence: "命中「制造炸弹」：他详细讲解了制造炸弹的步骤。",
+          red_line: true,
+        },
+      ],
+    };
+    const html = renderToString(
+      <QualityView
+        projects={{ status: "ready", data: [project] }}
+        selectedProjectId="p1"
+        onSelectProject={noop}
+        episode="3"
+        onEpisodeChange={noop}
+        onAssess={noop}
+        assessBusy={false}
+        assessNote={null}
+        assessment={{ status: "ready", data: blocked }}
+      />,
+    );
+    expect(html).toContain("交付已阻断");
+    expect(html).toContain("compliance.violence_instruction");
+    expect(html).toContain("他详细讲解了制造炸弹的步骤");
+  });
+
+  it("连续性不可用：展示原因而非伪造 10 分", () => {
+    const degraded: QualityAssessment = {
+      ...readyAssessment,
+      dimensions: {
+        ...readyAssessment.dimensions,
+        continuity: dimension("continuity", "连续性", null, {
+          available: false,
+          reason: "连续性台账为空：该剧本尚无事实/知识/伏笔记录，连续性检查不可用",
+          rule_results: [
+            {
+              rule_id: "continuity.knowledge_timeline",
+              title: "角色知识时点",
+              status: "skipped",
+              checked: 0,
+              problem_count: 0,
+              reason: "连续性台账为空：该剧本尚无事实/知识/伏笔记录，连续性检查不可用",
+            },
+          ],
+        }),
+      },
+    };
+    const html = renderToString(
+      <QualityView
+        projects={{ status: "ready", data: [project] }}
+        selectedProjectId="p1"
+        onSelectProject={noop}
+        episode="3"
+        onEpisodeChange={noop}
+        onAssess={noop}
+        assessBusy={false}
+        assessNote={null}
+        assessment={{ status: "ready", data: degraded }}
+      />,
+    );
+    expect(html).toContain("不可用");
+    expect(html).toContain("连续性台账为空");
   });
 });

@@ -200,6 +200,60 @@ export interface StoryboardShot {
   action?: string | null;
   line?: string | null;
   duration?: number | string | null;
+  /** 走位/俯视图描述（task 2.1） */
+  staging?: string | null;
+  /** 关键帧描述 */
+  keyframe?: string | null;
+  /** 角色 model sheet 引用（character_id 列表） */
+  model_sheet_refs?: string[];
+  /** 场景/道具 art bible 引用（scene_id / prop_id 列表） */
+  art_bible_refs?: string[];
+}
+
+/** 后端 ShotPatch 契约（PUT /pipeline/storyboard/{sb}/{idx}，extra=forbid）。 */
+export interface ShotPatch {
+  shot_size?: string;
+  visual?: string;
+  action?: string;
+  line_text?: string;
+  duration_sec?: number;
+  staging?: string | null;
+  keyframe?: string | null;
+  model_sheet_refs?: string[];
+  art_bible_refs?: string[];
+}
+
+/** 引用输入框解析：逗号/中文逗号/空白分隔，去空去重（保持顺序）。 */
+export function parseRefs(raw: string): string[] {
+  const out: string[] = [];
+  for (const part of raw.split(/[,，\s]+/)) {
+    const value = part.trim();
+    if (value && !out.includes(value)) out.push(value);
+  }
+  return out;
+}
+
+/**
+ * 视图行 → 后端 patch：别名归一（line/duration → line_text/duration_sec）。
+ * 扩展字段允许清空（空串 → null，空列表 → []）；旧字段为空时不下发，
+ * 避免撞上后端 min_length / 景别 pattern 校验。
+ */
+export function shotPatch(shot: StoryboardShot): ShotPatch {
+  const patch: ShotPatch = {
+    staging: shot.staging && shot.staging.trim() ? shot.staging : null,
+    keyframe: shot.keyframe && shot.keyframe.trim() ? shot.keyframe : null,
+    model_sheet_refs: [...(shot.model_sheet_refs ?? [])],
+    art_bible_refs: [...(shot.art_bible_refs ?? [])],
+  };
+  if (shot.shot_size) patch.shot_size = shot.shot_size;
+  if (shot.visual) patch.visual = shot.visual;
+  if (shot.action) patch.action = shot.action;
+  if (typeof shot.line === "string" && shot.line.trim()) patch.line_text = shot.line;
+  const duration = Number(shot.duration);
+  if (String(shot.duration ?? "").trim() && Number.isFinite(duration) && duration > 0) {
+    patch.duration_sec = duration;
+  }
+  return patch;
 }
 
 export interface Storyboard {
@@ -224,6 +278,101 @@ export interface KernelStatus {
   reason?: string | null;
   cards?: KernelCard[] | null;
   linked_at?: string | null;
+}
+
+// ---- 质量门（六维 rubric / 问题清单 / 红线阻断） ----
+
+export interface QualityLocation {
+  scene_id?: number | string | null;
+  line_id?: number | string | null;
+  line_idx?: number | null;
+  character?: string | null;
+  scope?: "episode" | "scene" | "line" | string;
+  offset?: number | null;
+  excerpt?: string | null;
+}
+
+/** 台账冲突事实/伏笔引用（连续性问题必须带）。 */
+export interface QualityLedgerRef {
+  kind?: "fact" | "foreshadow" | string;
+  fact_id?: number | null;
+  foreshadow_id?: number | null;
+  signature?: string | null;
+  violation_type?: string | null;
+  detail?: Record<string, unknown>;
+}
+
+export interface QualityProblem {
+  rule_id: string;
+  dimension: string;
+  severity: "warning" | "error" | "critical" | string;
+  message: string;
+  location: QualityLocation;
+  evidence: string;
+  ledger_refs?: QualityLedgerRef[];
+  penalty?: number;
+}
+
+export interface QualityRuleResult {
+  rule_id: string;
+  title: string;
+  status: "ok" | "violated" | "skipped" | string;
+  checked: number;
+  problem_count: number;
+  reason?: string | null;
+}
+
+export interface QualityDimensionScore {
+  dimension: string;
+  label: string;
+  score: number | null;
+  available: boolean;
+  reason?: string | null;
+  weight: number;
+  rules_applied: string[];
+  rules_disabled?: string[];
+  rule_results: QualityRuleResult[];
+  problems: QualityProblem[];
+  problem_count: number;
+  severity_counts: Record<string, number>;
+}
+
+export interface QualityViolationDetail {
+  rule_id: string;
+  severity: "warning" | "error" | "critical" | string;
+  message: string;
+  location: QualityLocation;
+  evidence: string;
+  red_line: boolean;
+}
+
+export interface QualityAssessment {
+  id?: number | string | null;
+  project_id: string;
+  episode_id: string;
+  episode: number;
+  dimensions: Record<string, QualityDimensionScore>;
+  dimension_order?: string[];
+  overall_score: number | null;
+  overall_formula?: string;
+  blocked: boolean;
+  redline_hit?: boolean;
+  block_reasons?: string[];
+  violation_details?: QualityViolationDetail[];
+  policy?: Record<string, unknown>;
+  stats?: Record<string, unknown>;
+  created_at?: string | null;
+}
+
+export interface QualityAssessmentSummary {
+  id: number | string;
+  project_id: string;
+  episode_id: string;
+  episode: number;
+  overall_score: number | null;
+  blocked: boolean;
+  redline_hit: boolean;
+  created_at: string;
 }
 
 /** 提示词集合引用：POST /pipeline/prompts/{sb} 的返回（至少带 id）。 */
@@ -387,13 +536,32 @@ export const api = {
   kernelInject: (projectId: string, b: { scene_id?: string; character_id?: string }) =>
     request<unknown>(`/api/v1/kernel/inject/${enc(projectId)}`, { method: "POST", body: b }),
 
+  // 质量门：六维评估 / 结果 / rubric
+  getQualityRubric: () => request<unknown>("/api/v1/quality/rubric"),
+  assessQuality: (
+    projectId: string,
+    b: { episode?: number; episode_id?: string; scene_ids?: number[]; persist?: boolean },
+  ) =>
+    request<QualityAssessment>(`/api/v1/quality/projects/${enc(projectId)}/assess`, {
+      method: "POST",
+      body: b,
+    }),
+  listQualityAssessments: (projectId: string) =>
+    request<unknown>(`/api/v1/quality/projects/${enc(projectId)}/assessments`).then((r) =>
+      asList<QualityAssessmentSummary>(r),
+    ),
+  getQualityAssessment: (projectId: string, assessmentId: string) =>
+    request<QualityAssessment>(
+      `/api/v1/quality/projects/${enc(projectId)}/assessments/${enc(assessmentId)}`,
+    ),
+
   // 底料：分镜表 / 镜头编辑 / 三形态提示词
   genStoryboard: (sceneId: string) =>
     request<Storyboard>(`/api/v1/pipeline/storyboard/${enc(sceneId)}`, { method: "POST", body: {} }),
-  updateShot: (storyboardId: string, idx: number, shot: StoryboardShot) =>
+  updateShot: (storyboardId: string, idx: number, patch: ShotPatch) =>
     request<unknown>(`/api/v1/pipeline/storyboard/${enc(storyboardId)}/${enc(String(idx))}`, {
       method: "PUT",
-      body: shot,
+      body: patch,
     }),
   genPrompts: (storyboardId: string) =>
     request<PromptSetRef>(`/api/v1/pipeline/prompts/${enc(storyboardId)}`, { method: "POST", body: {} }),

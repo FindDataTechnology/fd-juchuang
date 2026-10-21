@@ -9,6 +9,11 @@
   字数定时长）；LLM 为可选增强，任何失败回退确定性版并标 engine。
 - 角色一致性（design D4）：含某角色的镜头，image/video 提示词自动注入该角色
   appearance 要素集原文 + character_id，跨镜头同角色要素集严格一致。
+- 分镜字段扩展（change juchuang-continuity-layer task 2.1-2.3）：镜头行除景别/
+  画面/动作/台词/时长外，还含 staging（走位/俯视图）、keyframe（关键帧描述）、
+  model_sheet_refs（角色 model sheet 引用）、art_bible_refs（场景/道具 art bible
+  引用）。四个字段都落在 shot JSON 内，旧行缺键时按 None / [] 读取；迁移只补键，
+  不改既有字段。提示词对引用资产注入锁定要素：同一角色/场景跨镜头注入原文一致。
 
 存储：共库 FD_JUCHUANG_DB（默认 juchuang.db），本模块自建两张表：
   storyboard(id, scene_id INTEGER, idx, shot JSON, created_at)
@@ -33,9 +38,9 @@ import sqlite3
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from . import llm
+from . import ledger, llm
 
 router = APIRouter(prefix="/api/v1/pipeline", tags=["pipeline"])
 
@@ -50,6 +55,10 @@ PROMPT_FORMS = ("image", "video", "narrative")
 CHARS_PER_SEC = 3
 ESTABLISH_SEC = 4
 ENDING_SEC = 3
+
+# 分镜镜头的扩展字段（旧行缺键时按 None / [] 读取，见 _normalize_shot）
+SHOT_TEXT_FIELDS = ("staging", "keyframe")
+SHOT_REF_FIELDS = ("model_sheet_refs", "art_bible_refs")
 
 
 # ---------------------------------------------------------------- 存储（共库自建表）
@@ -91,12 +100,74 @@ def migrate(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _upgrade_shot_schema(conn)
     conn.commit()
+
+
+# ---------------------------------------------------------------- 分镜 JSON 字段迁移
+
+
+def _norm_text(value: Any) -> str | None:
+    """空串/空白/非字符串一律归一为 None（“未设置”的统一表示）。"""
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return None
+
+
+def _norm_refs(raw: Any) -> list[str]:
+    """引用列表归一：字符串化、去空白、去重且保持顺序；非列表值视为空。"""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if item is None:
+            continue
+        value = str(item).strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _normalize_shot(raw: Any, idx: int) -> dict:
+    """旧行/脏行归一：补齐扩展字段并修正类型，不改动既有字段。
+
+    旧版 storyboard 行只有 idx/shot_size/visual/action/line_text/line_speaker/
+    duration_sec/engine；缺失的 staging/keyframe 读作 None，引用列表读作 []。
+    """
+    shot = dict(raw) if isinstance(raw, dict) else {}
+    if not isinstance(shot.get("idx"), int):
+        shot["idx"] = idx
+    for key in SHOT_TEXT_FIELDS:
+        shot[key] = _norm_text(shot.get(key))
+    for key in SHOT_REF_FIELDS:
+        shot[key] = _norm_refs(shot.get(key))
+    return shot
+
+
+def _upgrade_shot_schema(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给既有镜头行补齐扩展字段（只补键，不改内容；可无限重放）。"""
+    changed: list[tuple[str, int]] = []
+    for row in conn.execute("SELECT id, idx, shot FROM storyboard").fetchall():
+        try:
+            raw = json.loads(row["shot"])
+        except (json.JSONDecodeError, TypeError):
+            continue  # 坏行不阻塞迁移，读取侧 _normalize_shot 仍会兜底
+        shot = _normalize_shot(raw, row["idx"])
+        if shot != raw:
+            changed.append((json.dumps(shot, ensure_ascii=False), row["id"]))
+    if changed:
+        conn.executemany("UPDATE storyboard SET shot = ? WHERE id = ?", changed)
 
 
 def _row_shot(row: sqlite3.Row) -> dict:
     return {"id": row["id"], "scene_id": row["scene_id"], "idx": row["idx"],
-            "shot": json.loads(row["shot"]), "created_at": row["created_at"]}
+            "shot": _normalize_shot(json.loads(row["shot"]), row["idx"]),
+            "created_at": row["created_at"]}
 
 
 def _load_storyboard(conn: sqlite3.Connection, storyboard_id: int) -> list[dict]:
@@ -137,8 +208,45 @@ def _pick(mapping: Any, *keys: str, default: Any = None) -> Any:
     return default
 
 
+def _scene_art_bible_elements(scene: dict, heading: str, synopsis: str) -> list[str]:
+    """场景 art bible 锁定要素：显式 art_bible 优先，否则由场次信息确定性生成。
+
+    同一场次的所有镜头共享同一组要素，保证跨镜头场景/道具外观一致（task 2.3）。
+    """
+    explicit = _norm_elements(
+        _pick(scene, "art_bible", "art_bible_elements", "visual_bible"))
+    if explicit:
+        return explicit
+    elements = [f"环境：{heading}"]
+    if synopsis:
+        elements.append(f"氛围：{synopsis}")
+    action = _pick(scene, "action", "action_text", default="")
+    if isinstance(action, str) and action.strip():
+        elements.append(f"场景描述：{action.strip()}")
+    return elements
+
+
+def _normalize_props(bundle: Any) -> list[dict]:
+    """道具 art bible（可选）：id/name/锁定要素；上游无道具表时为空列表。"""
+    props_raw = _pick(bundle, "props", "art_bible_props", "set_pieces", default=[]) or []
+    props: list[dict] = []
+    for item in props_raw:
+        pid = _pick(item, "id", "prop_id")
+        if pid is None:
+            continue
+        props.append({
+            "id": str(pid),
+            "name": str(_pick(item, "name", "prop_name", "title",
+                              default=f"道具 {pid}")).strip(),
+            "elements": _norm_elements(
+                _pick(item, "art_bible_elements", "art_bible", "elements",
+                      "appearance")),
+        })
+    return props
+
+
 def _normalize_bundle(bundle: Any, scene_id: int) -> dict:
-    """容忍少量键名别名的归一化（id 一律字符串，沿用 screenplay 的 uuid hex）。"""
+    """容忍少量键名别名的归一化（id 一律整型 rowid，沿用 screenplay 契约）。"""
     scene = _pick(bundle, "scene", default={}) or {}
     lines_raw = _pick(bundle, "lines", "dialogues", "speeches", default=[]) or []
     chars_raw = _pick(bundle, "characters", "cast", "roles", default=[]) or []
@@ -159,24 +267,33 @@ def _normalize_bundle(bundle: Any, scene_id: int) -> dict:
         name = _pick(item, "name", "character_name", default="")
         if cid is None or not str(name).strip():
             continue
+        appearance = _norm_elements(
+            _pick(item, "appearance_elements", "appearance", "elements",
+                  "elements_set", "style_elements"))
+        model_sheet = _norm_elements(
+            _pick(item, "model_sheet_elements", "model_sheet", "sheet_elements"))
         characters.append({
             "id": int(cid),
             "name": str(name).strip(),
-            "appearance_elements": _norm_elements(
-                _pick(item, "appearance_elements", "appearance", "elements",
-                      "elements_set", "style_elements")),
+            "appearance_elements": appearance,
+            # model sheet 锁定要素：显式给出则用显式版，否则与角色要素集同源
+            "model_sheet_elements": model_sheet or list(appearance),
         })
+
+    heading = str(_pick(scene, "heading", "scene_heading", "title",
+                        "name", default=f"场次 {scene_id}"))
+    synopsis = str(_pick(scene, "synopsis", "summary", "description", default=""))
 
     return {
         "scene": {
             "id": int(_pick(scene, "id", default=scene_id)),
-            "heading": str(_pick(scene, "heading", "scene_heading", "title",
-                                 "name", default=f"场次 {scene_id}")),
-            "synopsis": str(_pick(scene, "synopsis", "summary", "description",
-                                  default="")),
+            "heading": heading,
+            "synopsis": synopsis,
+            "art_bible_elements": _scene_art_bible_elements(scene, heading, synopsis),
         },
         "lines": lines,
         "characters": characters,
+        "props": _normalize_props(bundle),
     }
 
 
@@ -218,16 +335,34 @@ def load_scene_bundle(scene_id: int) -> dict:
 # ---------------------------------------------------------------- 4.1 剧本 → 分镜（确定性 + LLM 润色）
 
 
+def _scene_ref(bundle: dict) -> str | None:
+    sid = (bundle.get("scene") or {}).get("id")
+    return str(sid) if sid is not None else None
+
+
+def _character_refs(speaker: str, by_name: dict[str, dict]) -> list[str]:
+    """镜头归属角色的 model sheet 引用（无台词/旁白镜为空）。"""
+    char = by_name.get(speaker) if speaker else None
+    return [str(char["id"])] if char else []
+
+
 def _deterministic_shots(bundle: dict) -> list[dict]:
     scene = bundle["scene"]
     heading, synopsis = scene["heading"], scene["synopsis"]
     setting = f"{heading}；{synopsis}" if synopsis else heading
+    scene_ref = _scene_ref(bundle)
+    art_refs = [scene_ref] if scene_ref else []
+    by_name = {c["name"]: c for c in bundle.get("characters") or []}
 
     shots: list[dict] = [{
         "idx": 0,
         "shot_size": "全景",
         "visual": f"{setting}（定场）",
         "action": "镜头缓推，交代环境与人物站位",
+        "staging": f"俯视图：{heading}的空间关系全景铺陈，人物入口与主光方向标在画面边缘",
+        "keyframe": f"关键帧：{setting}的空镜定场，画面先立住空间与光影",
+        "model_sheet_refs": [],
+        "art_bible_refs": list(art_refs),
         "line_text": None,
         "line_speaker": None,
         "duration_sec": ESTABLISH_SEC,
@@ -237,12 +372,25 @@ def _deterministic_shots(bundle: dict) -> list[dict]:
         text, speaker = line["text"], line["speaker"]
         size = SHOT_SIZES[len(text) % 4]  # 按句长轮换景别
         excerpt = text[:16] + "…" if len(text) > 16 else text
+        side = "左" if pos % 2 else "右"
+        counter = "右" if side == "左" else "左"
+        if speaker:
+            staging = (f"俯视图：{speaker}位于画面{side}侧，对话对象在{counter}侧，"
+                       f"二人沿{size}的对话轴相对站位")
+            keyframe = f"关键帧：{speaker}在{size}中的定格，表情与手势正对「{excerpt}」"
+        else:
+            staging = "俯视图：空镜，机位沿场景纵深缓慢推移"
+            keyframe = f"关键帧：{size}空镜，画面随旁白停在「{excerpt}」"
         shots.append({
             "idx": pos,
             "shot_size": size,
             "visual": f"{setting}；{speaker or '旁白'}（{size}）：{excerpt}",
             "action": f"{speaker or '旁白'}开口，神情与手势随语义起伏" if speaker
                       else "画面随旁白语流缓缓推移",
+            "staging": staging,
+            "keyframe": keyframe,
+            "model_sheet_refs": _character_refs(speaker, by_name),
+            "art_bible_refs": list(art_refs),
             "line_text": text,
             "line_speaker": speaker or None,
             "duration_sec": max(2, math.ceil(len(text) / CHARS_PER_SEC)),
@@ -253,6 +401,10 @@ def _deterministic_shots(bundle: dict) -> list[dict]:
         "shot_size": "全景",
         "visual": f"{setting}，对话落定，全场归于静默（收尾）",
         "action": "镜头缓缓拉远，收束全场",
+        "staging": "俯视图：人物沿对话轴收拢至画面中央，机位退向后景",
+        "keyframe": "关键帧：对话落定后的静默瞬间，画面留白收束",
+        "model_sheet_refs": [],
+        "art_bible_refs": list(art_refs),
         "line_text": None,
         "line_speaker": None,
         "duration_sec": ENDING_SEC,
@@ -276,8 +428,13 @@ def _loads_lenient(content: str) -> Any:
         raise
 
 
-def _polish_with_llm(shots: list[dict], bundle: dict) -> list[dict]:
-    """LLM 仅润色 visual/action（一次性整场调用）；任何失败抛 LLMError 由调用方降级。"""
+def _polish_with_llm(shots: list[dict], bundle: dict,
+                     continuity_text: str | None = None) -> list[dict]:
+    """LLM 仅润色 visual/action（一次性整场调用）；任何失败抛 LLMError 由调用方降级。
+
+    ``continuity_text`` 为 task 3.5 的生成前上下文（时点有效事实/角色知识/伏笔），
+    仅作为约束注入，不参与镜头归属与字段锁定。
+    """
     scene = bundle["scene"]
     material = [
         {"idx": s["idx"], "shot_size": s["shot_size"], "visual": s["visual"],
@@ -288,12 +445,18 @@ def _polish_with_llm(shots: list[dict], bundle: dict) -> list[dict]:
     system = (
         "你是电影分镜师。对给定镜头表逐镜润色画面描述(visual)与动作(action)，"
         "使其更具镜头感与可视性；不得改变景别、台词、时长与镜头归属。"
-        '只输出 JSON 数组：[{"idx": int, "visual": str, "action": str}, ...]，不要多余文字。'
+        + (
+            "参考连续性台账：不得让角色使用其尚不知晓的信息，不得提前使用未来才成立的事实。"
+            if continuity_text else ""
+        )
+        + '只输出 JSON 数组：[{"idx": int, "visual": str, "action": str}, ...]，不要多余文字。'
     )
+    payload: dict[str, Any] = {"scene": scene, "shots": material}
+    if continuity_text:
+        payload["continuity"] = continuity_text
     content = llm.chat(
         [{"role": "system", "content": system},
-         {"role": "user", "content": json.dumps(
-             {"scene": scene, "shots": material}, ensure_ascii=False)}],
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
         temperature=0.4,
         max_tokens=1600,
     )
@@ -320,13 +483,14 @@ def _polish_with_llm(shots: list[dict], bundle: dict) -> list[dict]:
     return [by_idx[s["idx"]] for s in shots]
 
 
-def build_storyboard(bundle: dict) -> tuple[list[dict], str]:
+def build_storyboard(bundle: dict,
+                     continuity_text: str | None = None) -> tuple[list[dict], str]:
     """确定性版必做；.llm 有 KEY 时尝试 LLM 润色，超时/失败回退并标 engine。"""
     shots = _deterministic_shots(bundle)
     engine = "deterministic"
     if llm.is_configured():
         try:
-            shots = _polish_with_llm(shots, bundle)
+            shots = _polish_with_llm(shots, bundle, continuity_text=continuity_text)
             engine = "llm"
         except llm.LLMError:
             shots = _deterministic_shots(bundle)
@@ -337,8 +501,12 @@ def build_storyboard(bundle: dict) -> tuple[list[dict], str]:
 
 
 class ShotPatch(BaseModel):
-    """逐镜人工编辑（人在环上）：至少改一格，景别限定四档。"""
-    model_config = ConfigDict(extra="forbid")
+    """逐镜人工编辑（人在环上）：至少改一格，景别限定四档。
+
+    扩展字段：staging/keyframe 用空串或 null 清空；model_sheet_refs/
+    art_bible_refs 用 [] 清空。引用 ID 统一字符串化并去重。
+    """
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     shot_size: str | None = Field(default=None, pattern="^(全景|中景|近景|特写)$")
     visual: str | None = Field(default=None, min_length=1, max_length=2000)
@@ -346,13 +514,31 @@ class ShotPatch(BaseModel):
     line_text: str | None = Field(default=None, max_length=2000)
     line_speaker: str | None = Field(default=None, max_length=200)
     duration_sec: float | None = Field(default=None, gt=0, le=600)
+    staging: str | None = Field(default=None, max_length=2000)
+    keyframe: str | None = Field(default=None, max_length=2000)
+    model_sheet_refs: list[str] | None = Field(default=None, max_length=64)
+    art_bible_refs: list[str] | None = Field(default=None, max_length=64)
+
+    @field_validator("model_sheet_refs", "art_bible_refs")
+    @classmethod
+    def _normalize_refs(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else _norm_refs(value)
 
 
 @router.post("/storyboard/{scene_id}")
-def create_storyboard(scene_id: int) -> dict:
-    """场次 → 镜头表（重转 = 整场替换；产出后逐镜 PUT 编辑）。"""
+def create_storyboard(scene_id: int,
+                      episode: int | None = Query(default=None, ge=1)) -> dict:
+    """场次 → 镜头表（重转 = 整场替换；产出后逐镜 PUT 编辑）。
+
+    连续性台账接缝（change juchuang-continuity-layer task 3.5-3.7）：
+    - 生成前按 ``episode``（缺省取场次 idx）组装时点上下文，注入 LLM 润色提示；
+    - 生成后对镜头台词做确定性检查（实体名/知识时点/伏笔状态）；
+    - 台账为空或不可用时两段都返回 ``available=False``，生成照常完成。
+    """
     bundle = load_scene_bundle(scene_id)
-    shots, engine = build_storyboard(bundle)
+    pre = ledger.pre_generation_context_for_scene(scene_id, episode=episode)
+    continuity_text = pre.get("text") if pre.get("available") else None
+    shots, engine = build_storyboard(bundle, continuity_text=continuity_text)
     conn = connect()
     try:
         with conn:
@@ -364,12 +550,25 @@ def create_storyboard(scene_id: int) -> dict:
         rows = _load_storyboard(conn, scene_id)
     finally:
         conn.close()
+    post = ledger.post_generation_check_for_scene(
+        scene_id, shots, episode=pre.get("episode") or episode)
+    available = bool(pre.get("available") or post.get("available"))
     return {
         "scene_id": scene_id,
         "storyboard_id": scene_id,
         "engine": engine,
         "shot_count": len(rows),
         "shots": [r["shot"] for r in rows],
+        "continuity": {
+            "available": available,
+            "enabled": bool(pre.get("enabled") or post.get("enabled")),
+            "reason": None if available else (
+                pre.get("reason") or post.get("reason") or ledger.EMPTY_LEDGER_REASON
+            ),
+            "episode": pre.get("episode", episode),
+            "pre": pre,
+            "post": post,
+        },
     }
 
 
@@ -387,10 +586,49 @@ def get_storyboard(storyboard_id: int) -> dict:
             "shot_count": len(rows), "shots": [r["shot"] for r in rows]}
 
 
+@router.get("/storyboard/{storyboard_id}/export")
+def export_storyboard(storyboard_id: int) -> Response:
+    """镜头表纯 JSON 下载体：staging/keyframe/model_sheet/art_bible 一并导出。"""
+    conn = connect()
+    try:
+        rows = _load_storyboard(conn, storyboard_id)
+    finally:
+        conn.close()
+    if not rows:
+        raise HTTPException(status_code=404,
+                            detail=f"场次 {storyboard_id} 尚无镜头表，先 POST 转分镜")
+    payload = {
+        "scene_id": storyboard_id,
+        "storyboard_id": storyboard_id,
+        "shot_count": len(rows),
+        "shots": [r["shot"] for r in rows],
+    }
+    filename = f"storyboard-{storyboard_id}.json"
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.put("/storyboard/{storyboard_id}/{idx}")
 def update_shot(storyboard_id: int, idx: int, patch: ShotPatch) -> dict:
-    """逐镜编辑一格（merge 语义：只覆盖提交的字段）。"""
-    fields = patch.model_dump(exclude_unset=True, exclude_none=True)
+    """逐镜编辑一格（merge 语义：只覆盖提交的字段）。
+
+    扩展字段支持清空：staging/keyframe 提交空串或 null、引用列表提交 []。
+    """
+    fields = patch.model_dump(exclude_unset=True)
+    for key in SHOT_TEXT_FIELDS:
+        if key in fields:
+            fields[key] = _norm_text(fields[key])
+    for key in SHOT_REF_FIELDS:
+        if key in fields and fields[key] is not None:
+            fields[key] = _norm_refs(fields[key])
+    # 旧字段维持原语义：提交 null 视为「不修改」，不能用于清空
+    for key in ("shot_size", "visual", "action", "line_text", "line_speaker",
+                "duration_sec"):
+        if fields.get(key) is None:
+            fields.pop(key, None)
     if not fields:
         raise HTTPException(status_code=400, detail="至少提交一个要编辑的字段")
     if "duration_sec" in fields:
@@ -429,6 +667,10 @@ def _characters_by_name(bundle: dict) -> dict[str, dict]:
     return {c["name"]: c for c in bundle["characters"]}
 
 
+def _characters_by_id(bundle: dict) -> dict[str, dict]:
+    return {str(c["id"]): c for c in bundle["characters"]}
+
+
 def _shot_character(shot: dict, chars: dict[str, dict]) -> dict | None:
     """镜头归属角色：按台词说话人对名（含要素集的角色卡即一致性锚点）。"""
     speaker = (shot.get("line_speaker") or "").strip()
@@ -439,23 +681,136 @@ def _element_text(elements: list[str]) -> str:
     return "；".join(elements)
 
 
+def _character_lock_segment(char: dict) -> str:
+    """角色锁定段：跨镜头逐字一致（spec：同一组外观/风格要素）。"""
+    return f"人物锁定——{char['name']}：{_element_text(char['appearance_elements'])}"
+
+
+def _model_sheet_elements(char: dict) -> list[str]:
+    """model sheet 锁定要素：显式 model sheet 优先，否则与角色要素集同源。"""
+    return list(char.get("model_sheet_elements")
+                or char.get("appearance_elements") or [])
+
+
+def _resolve_model_sheets(shot: dict, chars_by_id: dict[str, dict],
+                          char: dict | None) -> list[dict]:
+    """按 model_sheet_refs 解析角色 model sheet；旧行无引用时沿用说话人角色卡。"""
+    refs = _norm_refs(shot.get("model_sheet_refs"))
+    if not refs and char is not None:
+        refs = [str(char["id"])]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for ref in refs:
+        target = chars_by_id.get(ref)
+        if target is None or ref in seen:
+            continue
+        seen.add(ref)
+        out.append({
+            "ref": ref,
+            "id": target["id"],
+            "name": target["name"],
+            "elements": _model_sheet_elements(target),
+        })
+    return out
+
+
+def _scene_art_bible_entry(bundle: dict) -> dict:
+    """场景 art bible 条目：整场共享的锁定要素（旧 bundle 由场次信息兜底）。"""
+    scene = bundle["scene"]
+    elements = list(scene.get("art_bible_elements") or [])
+    if not elements:
+        elements = _scene_art_bible_elements(
+            scene, scene["heading"], scene.get("synopsis") or "")
+    return {
+        "ref": str(scene["id"]),
+        "kind": "scene",
+        "name": scene["heading"],
+        "elements": elements,
+    }
+
+
+def _resolve_art_bible(shot: dict, bundle: dict) -> list[dict]:
+    """按 art_bible_refs 解析场景/道具 art bible；未知引用忽略，空引用场景兜底。
+
+    refs 指向场次 id → 场景条目；指向 props[].id → 道具条目；其余忽略（不报错），
+    全部未解析时退回场景 art bible，保证旧数据仍注入同一组场景要素。
+    """
+    scene_entry = _scene_art_bible_entry(bundle)
+    props = {p["id"]: p for p in bundle.get("props") or []}
+    refs = _norm_refs(shot.get("art_bible_refs"))
+    if not refs:
+        return [scene_entry]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        if ref == scene_entry["ref"]:
+            out.append(scene_entry)
+        elif ref in props:
+            prop = props[ref]
+            out.append({"ref": ref, "kind": "prop", "name": prop["name"],
+                        "elements": list(prop["elements"])})
+    return out or [scene_entry]
+
+
+def _shot_locks(shot: dict, bundle: dict, char: dict | None,
+                chars_by_id: dict[str, dict]) -> tuple[list[str], list[dict], list[dict]]:
+    """生成镜头的锁定段，并返回结构化 model_sheets / art_bible（供导出）。"""
+    segments: list[str] = []
+    if char:
+        segments.append(_character_lock_segment(char))
+    model_sheets = _resolve_model_sheets(shot, chars_by_id, char)
+    for sheet in model_sheets:
+        if (char is not None and str(sheet["id"]) == str(char["id"])
+                and sheet["elements"] == list(char["appearance_elements"])):
+            continue  # 与人物锁定段同一组要素，不重复注入
+        segments.append(f"model_sheet〔{sheet['ref']}·{sheet['name']}〕锁定："
+                        f"{_element_text(sheet['elements'])}")
+    art_bible = _resolve_art_bible(shot, bundle)
+    for entry in art_bible:
+        kind = "场景" if entry["kind"] == "scene" else "道具"
+        segments.append(f"art_bible〔{kind} {entry['ref']}·{entry['name']}〕锁定："
+                        f"{_element_text(entry['elements'])}")
+    return segments, model_sheets, art_bible
+
+
+def _shot_extras(shot: dict, model_sheets: list[dict], art_bible: list[dict]) -> dict:
+    """导出用扩展字段（旧行缺键时 staging/keyframe 为 null、引用为 []）。"""
+    return {
+        "staging": _norm_text(shot.get("staging")),
+        "keyframe": _norm_text(shot.get("keyframe")),
+        "model_sheet_refs": _norm_refs(shot.get("model_sheet_refs")),
+        "art_bible_refs": _norm_refs(shot.get("art_bible_refs")),
+        "model_sheets": model_sheets,
+        "art_bible": art_bible,
+    }
+
+
 def _build_image_payload(storyboard_id: int, bundle: dict, shots: list[dict]) -> dict:
     chars = _characters_by_name(bundle)
+    chars_by_id = _characters_by_id(bundle)
     out = []
     for shot in shots:
         char = _shot_character(shot, chars)
-        prompt = f"{STYLE_ANCHOR}｜{shot['visual']}"
-        if char:
-            # 角色一致性（spec）：要素集原文注入 + character_id 字段
-            prompt += (f"｜人物锁定——{char['name']}"
-                       f"：{_element_text(char['appearance_elements'])}")
+        locks, model_sheets, art_bible = _shot_locks(shot, bundle, char, chars_by_id)
+        parts = [STYLE_ANCHOR, shot["visual"]]
+        staging = _norm_text(shot.get("staging"))
+        keyframe = _norm_text(shot.get("keyframe"))
+        if staging:
+            parts.append(f"走位：{staging}")
+        if keyframe:
+            parts.append(f"关键帧：{keyframe}")
+        parts.extend(locks)
         out.append({
             "idx": shot["idx"],
             "shot_size": shot["shot_size"],
-            "prompt": prompt,
+            "prompt": "｜".join(parts),
             "character_id": char["id"] if char else None,
             "character_name": char["name"] if char else None,
             "character_elements": list(char["appearance_elements"]) if char else [],
+            **_shot_extras(shot, model_sheets, art_bible),
         })
     return {
         "form": "image",
@@ -469,6 +824,7 @@ def _build_image_payload(storyboard_id: int, bundle: dict, shots: list[dict]) ->
 
 def _build_video_payload(storyboard_id: int, bundle: dict, shots: list[dict]) -> dict:
     chars = _characters_by_name(bundle)
+    chars_by_id = _characters_by_id(bundle)
     out = []
     for shot in shots:
         char = _shot_character(shot, chars)
@@ -478,18 +834,24 @@ def _build_video_payload(storyboard_id: int, bundle: dict, shots: list[dict]) ->
             move = "缓慢拉远"
         else:
             move = CAMERA_MOVES[shot["idx"] % len(CAMERA_MOVES)]
-        desc = f"{shot['visual']}；{shot['action']}"
-        if char:
-            desc += (f"；人物锁定——{char['name']}"
-                     f"：{_element_text(char['appearance_elements'])}")
+        locks, model_sheets, art_bible = _shot_locks(shot, bundle, char, chars_by_id)
+        parts = [shot["visual"], shot["action"]]
+        staging = _norm_text(shot.get("staging"))
+        keyframe = _norm_text(shot.get("keyframe"))
+        if staging:
+            parts.append(f"走位：{staging}")
+        if keyframe:
+            parts.append(f"关键帧：{keyframe}")
+        parts.extend(locks)
         out.append({
             "idx": shot["idx"],
-            "shot": desc,
+            "shot": "；".join(parts),
             "duration_sec": shot["duration_sec"],
             "camera_move": move,
             "character_id": char["id"] if char else None,
             "character_name": char["name"] if char else None,
             "character_elements": list(char["appearance_elements"]) if char else [],
+            **_shot_extras(shot, model_sheets, art_bible),
         })
     return {
         "form": "video",

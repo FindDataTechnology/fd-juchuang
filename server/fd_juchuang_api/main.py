@@ -10,6 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
 from .kernel import router as kernel_router
+from .ledger import router as ledger_router
+from .quality import router as quality_router
 from .screenplay import router as screenplay_router
 
 app = FastAPI(title="fd-juchuang-api", version=__version__)
@@ -23,6 +25,8 @@ app.add_middleware(
 
 app.include_router(screenplay_router)
 app.include_router(kernel_router)
+app.include_router(ledger_router)
+app.include_router(quality_router)
 # pipeline 行为契约未含鉴权，挂载层统一补用户隔离（J3 交接建议）
 from fastapi import Depends  # noqa: E402
 

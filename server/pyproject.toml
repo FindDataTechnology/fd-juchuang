@@ -3,9 +3,9 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fd--api"
+name = "fd-juchuang-api"
 version = "0.1.0"
-description = "剧创产品门面服务端：论文检索/公文写作（shilun）或剧本创作与 AI 底料（juchuang）。"
+description = "剧创（Juchuang）产品门面服务端：剧本结构化项目/角色/场次/台词、底料管线与个人层自有存储。"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

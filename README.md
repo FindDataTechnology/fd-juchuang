@@ -32,6 +32,14 @@ cd server && pip install -e ".[dev]" && pytest && uvicorn fd_juchuang_api.main:a
 
 `fd-zhesi`（哲思）、`fd-shilun`（实论）、`fd-zhengxin`（政心）——同一家族、同一形制、各自独立售卖。
 
-## 已知欠账（与产品条线无关，另立）
+## 派生痕迹已清（2026-11-13）
 
-本仓自 `fd-zhesi` 派生，镜像与包名仍有派生痕迹：`server/pyproject.toml` 与 `deploy/README.md` 里的镜像名仍是 `fd--api` / `fd-zhesi-web`。改名要连带改 CI workflow、TCR 仓库与 GitOps 清单，属独立发布动作，不在本条线口径内处理。
+本仓自 `fd-zhesi` 派生，早期带进了几处同名残件，已处理：
+
+- `web/package.json` / `package-lock.json` 的包名 `fd-zhesi-web` → `fd-juchuang-web`
+- `server/pyproject.toml` 的包名 `fd--api` → `fd-juchuang-api`
+- 删除 `deploy/k8s/fd-zhesi-web.yaml`（同名的**哲思** Deployment，apply 会回滚兄弟产品）
+  与 `deploy/argocd/application.yaml`（指向 zhesi 仓的僵尸 Application）
+
+工作负载清单的真源在 `fd-infra-deploy` 的 `all-services-prod`，不在本仓——详见
+`deploy/README.md`。

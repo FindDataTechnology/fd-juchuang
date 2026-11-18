@@ -1,5 +1,5 @@
 export default {
-  nav: { login: "Sign in", logout: "Sign out", home: "Home", workbench: "Workbench", admin: "Admin", token: "Access token" },
+  nav: { login: "Sign in", logout: "Sign out", home: "Home", workbench: "Workbench", admin: "Admin", sessionCheckFailed: "Could not check your session.", retry: "Retry" },
   landing: {
     hero: {
       statement1: "First the script,",
@@ -56,7 +56,7 @@ export default {
     unavailable: "This capability is still being wired — try again later",
     error: "Something went wrong",
     retry: "Retry",
-    tokenHint: "Set your access token in the top-right corner (dev mode) or sign in first",
+    tokenHint: "Sign in to use this",
     pick: "Pick…",
     untitled: "(untitled)",
     saved: "Saved.",

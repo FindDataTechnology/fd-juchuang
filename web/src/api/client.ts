@@ -303,6 +303,38 @@ export interface GenerationResult {
   failures: GenerationFailure[];
   requested: number;
 }
+/** 两条成片通路各自的能力（spec：互不代表）。 */
+export interface VideoCapabilities {
+  i2v: { available: boolean; reason?: string; message?: string;
+         first_frame_supported?: boolean | null; generator?: string };
+  render: { available: boolean; reason?: string; message?: string; cost?: string };
+}
+export interface VideoEstimate {
+  confirmed: false;
+  estimated_calls: number;
+  estimated_seconds: number;
+  cost: string;
+  note?: string;
+}
+export interface VideoSubmitResult {
+  confirmed: true;
+  route: "i2v" | "render";
+  submitted?: { shot_idx: number; job_id?: string; provider_task_id?: string }[];
+  failures?: { shot_idx: number; category: string; message: string }[];
+  requested?: number;
+  note?: string;
+}
+export interface VideoRenderResult {
+  route: "render";
+  cost: string;
+  asset_id?: string;
+  file_paths?: string[];
+  download_url?: string | null;
+  segments?: { shot_idx: number; text: string; text_source: string; image?: string | null }[];
+  duration_source?: string;
+  note?: string;
+}
+
 export interface EditResult {
   storyboard_id: number | string;
   shot_idx: number;
@@ -623,6 +655,15 @@ export const api = {
       method: "POST",
       body: b,
     }),
+  getVideoCapabilities: () => request<VideoCapabilities>("/api/v1/pipeline/video/capabilities"),
+  createVideo: (
+    storyboardId: string,
+    b: { route: "i2v" | "render"; shot_idxs?: number[]; max_calls?: number; confirm?: boolean },
+  ) =>
+    request<VideoEstimate | VideoSubmitResult | VideoRenderResult>(
+      `/api/v1/pipeline/video/${enc(storyboardId)}`,
+      { method: "POST", body: b },
+    ),
   editShot: (storyboardId: string, shotIdx: number, b: { instruction: string; mask?: string }) =>
     request<EditResult>(
       `/api/v1/pipeline/shots/${enc(storyboardId)}/${enc(String(shotIdx))}/edit`,

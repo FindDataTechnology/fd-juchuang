@@ -134,6 +134,16 @@ describe("API 全挂时的降级态", () => {
       editBusyIdx={null}
       editNote={null}
       editResult={null}
+      videoCaps={{ status: "ready", data: { i2v: { available: true }, render: { available: true } } }}
+      onVideoI2v={() => {}}
+      onVideoRender={() => {}}
+      videoBusy={null}
+      videoNote={null}
+      videoEstimate={null}
+      videoSubmit={null}
+      videoRender={null}
+      onConfirmI2v={() => {}}
+      onCancelI2v={() => {}}
       />,
     );
     expect(html).toContain("接线中");
@@ -345,6 +355,16 @@ describe("就绪态关键渲染", () => {
       editBusyIdx={null}
       editNote={null}
       editResult={null}
+      videoCaps={{ status: "ready", data: { i2v: { available: true }, render: { available: true } } }}
+      onVideoI2v={() => {}}
+      onVideoRender={() => {}}
+      videoBusy={null}
+      videoNote={null}
+      videoEstimate={null}
+      videoSubmit={null}
+      videoRender={null}
+      onConfirmI2v={() => {}}
+      onCancelI2v={() => {}}
       />,
     );
     // 表头与镜头行

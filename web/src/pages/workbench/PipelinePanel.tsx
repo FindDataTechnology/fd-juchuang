@@ -15,6 +15,10 @@ import {
   type GenerateCapabilities,
   type GenerationResult,
   type EditResult,
+  type VideoCapabilities,
+  type VideoEstimate,
+  type VideoSubmitResult,
+  type VideoRenderResult,
 } from "../../api/client";
 import { Loadable, mapApiError, noteFromError, type Note } from "../../api/state";
 import {
@@ -111,6 +115,16 @@ export function PipelineView({
   editBusyIdx,
   editNote,
   editResult,
+  videoCaps,
+  onVideoI2v,
+  onVideoRender,
+  videoBusy,
+  videoNote,
+  videoEstimate,
+  videoSubmit,
+  videoRender,
+  onConfirmI2v,
+  onCancelI2v,
 }: {
   projects: Loadable<Project[]>;
   selectedProjectId: string;
@@ -143,6 +157,16 @@ export function PipelineView({
   editBusyIdx: number | null;
   editNote: Note;
   editResult: EditResult | null;
+  videoCaps: Loadable<VideoCapabilities>;
+  onVideoI2v: () => void;
+  onVideoRender: () => void;
+  videoBusy: "i2v" | "render" | null;
+  videoNote: Note;
+  videoEstimate: VideoEstimate | null;
+  videoSubmit: VideoSubmitResult | null;
+  videoRender: VideoRenderResult | null;
+  onConfirmI2v: () => void;
+  onCancelI2v: () => void;
 }) {
   const { t } = useTranslation();
   return (
@@ -379,6 +403,97 @@ export function PipelineView({
           </div>
         ) : null}
       </div>
+
+      {/* 第四步：成片（两条通路，成本口径分开） */}
+      <div className="rounded-lg border border-neutral-200 bg-white p-5">
+        <SectionTitle>{t("workbench.pipeline.step4")}</SectionTitle>
+        <p className="mt-1 text-sm text-neutral-500">{t("workbench.pipeline.step4Hint")}</p>
+
+        {videoCaps.status === "ready" ? (
+          <div className="mt-3 space-y-1 text-sm">
+            <CapLine label={t("workbench.pipeline.capI2v")} state={videoCaps.data.i2v} />
+            <CapLine label={t("workbench.pipeline.capRender")} state={videoCaps.data.render} />
+          </div>
+        ) : null}
+
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            disabled={videoBusy !== null || storyboard.status !== "ready" ||
+              videoCaps.status !== "ready" || !videoCaps.data.render.available}
+            onClick={onVideoRender}
+            className={btnPrimary}
+            title={videoCaps.status === "ready" && !videoCaps.data.render.available
+              ? videoCaps.data.render.message ?? videoCaps.data.render.reason : undefined}
+          >
+            {videoBusy === "render"
+              ? t("workbench.pipeline.videoRendering")
+              : t("workbench.pipeline.videoRender")}
+          </button>
+          <button
+            type="button"
+            disabled={videoBusy !== null || storyboard.status !== "ready" ||
+              videoCaps.status !== "ready" || !videoCaps.data.i2v.available}
+            onClick={onVideoI2v}
+            className={btnSecondary}
+            title={videoCaps.status === "ready" && !videoCaps.data.i2v.available
+              ? videoCaps.data.i2v.message ?? videoCaps.data.i2v.reason : undefined}
+          >
+            {videoBusy === "i2v"
+              ? t("workbench.pipeline.videoI2vBusy")
+              : t("workbench.pipeline.videoI2v")}
+          </button>
+        </div>
+        <p className="mt-1 text-xs text-neutral-400">
+          {t("workbench.pipeline.videoCostNote")}
+        </p>
+
+        <div className="mt-2 space-y-2">
+          <NoteBox note={videoNote} />
+        </div>
+
+        {videoEstimate ? (
+          <div className="mt-3 rounded border border-amber-200 bg-amber-50 p-3 text-sm">
+            <div>
+              {t("workbench.pipeline.i2vEstimate", {
+                calls: videoEstimate.estimated_calls,
+                secs: videoEstimate.estimated_seconds,
+              })}
+            </div>
+            <div className="mt-2 flex gap-2">
+              <button type="button" onClick={onConfirmI2v} className={btnPrimary}>
+                {t("workbench.pipeline.i2vConfirm")}
+              </button>
+              <button type="button" onClick={onCancelI2v} className={btnSecondary}>
+                {t("workbench.pipeline.i2vCancel")}
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {videoSubmit ? (
+          <div className="mt-3 text-sm text-neutral-600">
+            {t("workbench.pipeline.i2vSubmitted", { n: videoSubmit.submitted?.length ?? 0 })}
+            {(videoSubmit.failures ?? []).map((f) => (
+              <div key={f.shot_idx} className="mt-1 text-red-600">
+                {t("workbench.pipeline.shotFailed", { idx: f.shot_idx })} — {f.category}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {videoRender ? (
+          <div className="mt-3 text-sm text-neutral-600">
+            <div>{t("workbench.pipeline.videoRendered")}</div>
+            <div className="mt-1 text-xs text-neutral-500">
+              {(videoRender.file_paths ?? []).join(", ")}
+            </div>
+            <div className="mt-1 text-xs text-neutral-400">
+              {t("workbench.pipeline.durationByAudio")}
+            </div>
+          </div>
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -574,6 +689,12 @@ export default function PipelinePanel() {
   const [editBusyIdx, setEditBusyIdx] = useState<number | null>(null);
   const [editNote, setEditNote] = useState<Note>(null);
   const [editResult, setEditResult] = useState<EditResult | null>(null);
+  const [videoCaps, setVideoCaps] = useState<Loadable<VideoCapabilities>>({ status: "idle" });
+  const [videoBusy, setVideoBusy] = useState<"i2v" | "render" | null>(null);
+  const [videoNote, setVideoNote] = useState<Note>(null);
+  const [videoEstimate, setVideoEstimate] = useState<VideoEstimate | null>(null);
+  const [videoSubmit, setVideoSubmit] = useState<VideoSubmitResult | null>(null);
+  const [videoRender, setVideoRender] = useState<VideoRenderResult | null>(null);
   const [promptCache, setPromptCache] = useState<Partial<Record<PromptForm, unknown>>>({});
   const [downloadBusy, setDownloadBusy] = useState(false);
   const [downloadNote, setDownloadNote] = useState<Note>(null);
@@ -672,6 +793,73 @@ export default function PipelinePanel() {
       setEditNote(noteFromError(e));
     } finally {
       setEditBusyIdx(null);
+    }
+  };
+
+  useEffect(() => {
+    let alive = true;
+    setVideoCaps({ status: "loading" });
+    api
+      .getVideoCapabilities()
+      .then((c) => alive && setVideoCaps({ status: "ready", data: c }))
+      .catch((e) => alive && setVideoCaps(mapApiError(e)));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const videoRenderAction = async () => {
+    if (storyboard.status !== "ready") return;
+    setVideoBusy("render");
+    setVideoNote(null);
+    setVideoRender(null);
+    setVideoEstimate(null);
+    try {
+      const r = (await api.createVideo(storyboard.data.id, { route: "render" })) as VideoRenderResult;
+      setVideoRender(r);
+      setVideoNote({ ok: t("workbench.pipeline.videoRendered") });
+    } catch (e) {
+      setVideoNote(noteFromError(e));
+    } finally {
+      setVideoBusy(null);
+    }
+  };
+
+  const videoI2vAction = async () => {
+    if (storyboard.status !== "ready") return;
+    setVideoBusy("i2v");
+    setVideoNote(null);
+    setVideoSubmit(null);
+    setVideoRender(null);
+    try {
+      const r = await api.createVideo(storyboard.data.id, { route: "i2v" });
+      // 未确认时后端只返预估 —— 不发起任何付费调用
+      if ("estimated_calls" in r) {
+        setVideoEstimate(r as VideoEstimate);
+      } else {
+        setVideoSubmit(r as VideoSubmitResult);
+      }
+    } catch (e) {
+      setVideoNote(noteFromError(e));
+    } finally {
+      setVideoBusy(null);
+    }
+  };
+
+  const videoI2vConfirm = async () => {
+    if (storyboard.status !== "ready") return;
+    setVideoBusy("i2v");
+    setVideoNote(null);
+    try {
+      const r = (await api.createVideo(storyboard.data.id,
+        { route: "i2v", confirm: true })) as VideoSubmitResult;
+      setVideoSubmit(r);
+      setVideoEstimate(null);
+      setVideoNote({ ok: t("workbench.pipeline.i2vSubmitted", { n: r.submitted?.length ?? 0 }) });
+    } catch (e) {
+      setVideoNote(noteFromError(e));
+    } finally {
+      setVideoBusy(null);
     }
   };
 
@@ -788,6 +976,16 @@ export default function PipelinePanel() {
       editBusyIdx={editBusyIdx}
       editNote={editNote}
       editResult={editResult}
+      videoCaps={videoCaps}
+      onVideoI2v={() => void videoI2vAction()}
+      onVideoRender={() => void videoRenderAction()}
+      videoBusy={videoBusy}
+      videoNote={videoNote}
+      videoEstimate={videoEstimate}
+      videoSubmit={videoSubmit}
+      videoRender={videoRender}
+      onConfirmI2v={() => void videoI2vConfirm()}
+      onCancelI2v={() => setVideoEstimate(null)}
     />
   );
 }

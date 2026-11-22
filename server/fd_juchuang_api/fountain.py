@@ -211,10 +211,16 @@ class FountainFieldMapping:
         "characters.appearance": "角色要素集；Fountain 无对应元素，保留在结构化层",
         "characters.stance": "哲思立场标注；Fountain 不承载，导入不覆盖",
         "characters.created_at": "时间戳；不导出",
+        # change juchuang-image-iteration：生成侧资产绑定。Fountain 是剧本交换格式，
+        # 资产 id 属于生成面，跨格式携带会变成另一格式凭空多出的字段。
+        "characters.asset_id": "生成侧资产绑定（model sheet）；Fountain 不承载",
+        "characters.asset_slug": "生成侧资产绑定（可读 slug）；Fountain 不承载",
         "scenes.id": "内部主键；导入按标题/顺序匹配",
         "scenes.project_id": "归属信息；不导出",
         "scenes.conflict": "场次张力标注；Fountain 不承载，导入不覆盖",
         "scenes.created_at": "时间戳；不导出",
+        "scenes.asset_id": "生成侧资产绑定（场景 art bible）；Fountain 不承载",
+        "scenes.asset_slug": "生成侧资产绑定（可读 slug）；Fountain 不承载",
         "lines.id": "内部主键；导入重建",
         "lines.scene_id": "归属信息；不导出",
         "versions": "版本树不进入交换格式",

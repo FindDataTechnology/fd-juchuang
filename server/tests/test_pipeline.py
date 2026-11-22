@@ -247,7 +247,11 @@ def _make_promptsets(client: TestClient) -> dict[int, dict]:
     assert resp.status_code == 200, resp.text
     created = resp.json()
     assert created["schema_version"] == "1"
-    assert {p["form"] for p in created["promptsets"]} == {"image", "video", "narrative"}
+    # change juchuang-image-iteration：新增第四形态 `generation`（可执行生成计划）。
+    # 断言从「恰好三形态」改为「三种提示词形态必须在 + generation 必须在」——
+    # 前者会在每次加形态时误报，后者才是在保护「三形态不丢」这个行为。
+    forms = {p["form"] for p in created["promptsets"]}
+    assert {"image", "video", "narrative", "generation"} <= forms
     out = {}
     for p in created["promptsets"]:
         got = client.get(f"/api/v1/pipeline/prompts/{p['id']}")

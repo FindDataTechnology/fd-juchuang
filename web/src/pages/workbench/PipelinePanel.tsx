@@ -12,6 +12,9 @@ import {
   type Scene,
   type Storyboard,
   type StoryboardShot,
+  type GenerateCapabilities,
+  type GenerationResult,
+  type EditResult,
 } from "../../api/client";
 import { Loadable, mapApiError, noteFromError, type Note } from "../../api/state";
 import {
@@ -99,6 +102,15 @@ export function PipelineView({
   onDownload,
   downloadBusy,
   downloadNote,
+  caps,
+  onGenerate,
+  genBusy,
+  genNote,
+  genResult,
+  onEditShot,
+  editBusyIdx,
+  editNote,
+  editResult,
 }: {
   projects: Loadable<Project[]>;
   selectedProjectId: string;
@@ -122,6 +134,15 @@ export function PipelineView({
   onDownload: () => void;
   downloadBusy: boolean;
   downloadNote: Note;
+  caps: Loadable<GenerateCapabilities>;
+  onGenerate: () => void;
+  genBusy: boolean;
+  genNote: Note;
+  genResult: GenerationResult | null;
+  onEditShot: (shotIdx: number, instruction: string) => void;
+  editBusyIdx: number | null;
+  editNote: Note;
+  editResult: EditResult | null;
 }) {
   const { t } = useTranslation();
   return (
@@ -271,7 +292,148 @@ export function PipelineView({
           </div>
         )}
       </div>
+
+      {/* 第三步：出图与镜级修改（change juchuang-image-iteration） */}
+      <div className="rounded-lg border border-neutral-200 bg-white p-5">
+        <SectionTitle>{t("workbench.pipeline.step3")}</SectionTitle>
+        <p className="mt-1 text-sm text-neutral-500">{t("workbench.pipeline.step3Hint")}</p>
+
+        {caps.status === "ready" ? (
+          <div className="mt-3 space-y-1 text-sm">
+            <CapLine
+              label={t("workbench.pipeline.capGenerate")}
+              state={caps.data.generate}
+            />
+            <CapLine
+              label={t("workbench.pipeline.capEdit")}
+              state={caps.data.edit}
+            />
+          </div>
+        ) : null}
+        {caps.status === "unavailable" ? <DegradeBox /> : null}
+
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            disabled={
+              genBusy ||
+              storyboard.status !== "ready" ||
+              caps.status !== "ready" ||
+              !caps.data.generate.available
+            }
+            onClick={onGenerate}
+            className={btnPrimary}
+            title={
+              caps.status === "ready" && !caps.data.generate.available
+                ? caps.data.generate.message ?? caps.data.generate.reason ?? ""
+                : undefined
+            }
+          >
+            {genBusy ? t("workbench.pipeline.generating") : t("workbench.pipeline.generate")}
+          </button>
+        </div>
+
+        <div className="mt-2 space-y-2">
+          <NoteBox note={genNote} />
+          <NoteBox note={editNote} />
+        </div>
+
+        {genResult ? (
+          <div className="mt-3 text-sm text-neutral-600">
+            <div>
+              {t("workbench.pipeline.genSummary", {
+                ok: genResult.generated.length,
+                total: genResult.requested,
+              })}
+            </div>
+            {genResult.failures.map((f) => (
+              <div key={f.shot_idx} className="mt-1 text-red-600">
+                {t("workbench.pipeline.shotFailed", { idx: f.shot_idx })} — {f.category}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {editResult ? (
+          <div className="mt-2 text-sm text-neutral-600">
+            {t("workbench.pipeline.editDone", { idx: editResult.shot_idx })}
+          </div>
+        ) : null}
+
+        {storyboard.status === "ready" ? (
+          <div className="mt-5 space-y-2">
+            {(storyboard.data.shots ?? []).map((shot) => (
+              <EditShotRow
+                key={shot.idx}
+                shotIdx={shot.idx}
+                disabled={caps.status !== "ready" || !caps.data.edit.available}
+                disabledReason={
+                  caps.status === "ready" && !caps.data.edit.available
+                    ? caps.data.edit.message ?? caps.data.edit.reason ?? ""
+                    : undefined
+                }
+                busy={editBusyIdx === shot.idx}
+                onSubmit={onEditShot}
+              />
+            ))}
+          </div>
+        ) : null}
+      </div>
     </section>
+  );
+}
+
+function CapLine({ label, state }: { label: string; state: { available: boolean; reason?: string; message?: string } }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className={state.available ? "text-emerald-600" : "text-neutral-400"}>
+        {state.available ? "●" : "○"}
+      </span>
+      <span className="font-medium">{label}</span>
+      <span className="text-neutral-500">
+        {state.available ? "" : (state.message ?? state.reason ?? "")}
+      </span>
+    </div>
+  );
+}
+
+function EditShotRow({
+  shotIdx,
+  disabled,
+  disabledReason,
+  busy,
+  onSubmit,
+}: {
+  shotIdx: number;
+  disabled: boolean;
+  disabledReason?: string;
+  busy: boolean;
+  onSubmit: (shotIdx: number, instruction: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [text, setText] = useState("");
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded border border-neutral-100 bg-neutral-50 p-2">
+      <span className="w-16 text-sm text-neutral-500">
+        {t("workbench.pipeline.shotLabel", { idx: shotIdx })}
+      </span>
+      <input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder={t("workbench.pipeline.editPlaceholder")}
+        aria-label={t("workbench.pipeline.editInstruction")}
+        className="min-w-0 flex-1 rounded border border-neutral-300 px-2 py-1 text-sm"
+      />
+      <button
+        type="button"
+        disabled={disabled || busy || !text.trim()}
+        onClick={() => onSubmit(shotIdx, text.trim())}
+        className={btnSecondary}
+        title={disabled ? disabledReason : undefined}
+      >
+        {busy ? t("workbench.pipeline.editing") : t("workbench.pipeline.editThisShot")}
+      </button>
+    </div>
   );
 }
 
@@ -405,6 +567,13 @@ export default function PipelinePanel() {
   const [promptNote, setPromptNote] = useState<Note>(null);
   const [form, setForm] = useState<PromptForm>("image");
   const [promptData, setPromptData] = useState<Loadable<unknown>>({ status: "idle" });
+  const [caps, setCaps] = useState<Loadable<GenerateCapabilities>>({ status: "idle" });
+  const [genBusy, setGenBusy] = useState(false);
+  const [genNote, setGenNote] = useState<Note>(null);
+  const [genResult, setGenResult] = useState<GenerationResult | null>(null);
+  const [editBusyIdx, setEditBusyIdx] = useState<number | null>(null);
+  const [editNote, setEditNote] = useState<Note>(null);
+  const [editResult, setEditResult] = useState<EditResult | null>(null);
   const [promptCache, setPromptCache] = useState<Partial<Record<PromptForm, unknown>>>({});
   const [downloadBusy, setDownloadBusy] = useState(false);
   const [downloadNote, setDownloadNote] = useState<Note>(null);
@@ -441,6 +610,68 @@ export default function PipelinePanel() {
       setPromptData({ status: "ready", data });
     } catch (e) {
       setPromptData(mapApiError(e));
+    }
+  };
+
+  // 能力探测：进面板即查一次。失败不影响分镜/提示词（降级是分类不是异常）。
+  useEffect(() => {
+    let alive = true;
+    setCaps({ status: "loading" });
+    api
+      .getGenerateCapabilities()
+      .then((c) => alive && setCaps({ status: "ready", data: c }))
+      .catch((e) => alive && setCaps(mapApiError(e)));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const generateShots = async () => {
+    if (storyboard.status !== "ready") return;
+    if (caps.status !== "ready" || !caps.data.generate.available) {
+      // 不可用时必须有可见文案，不能静默无响应（spec 5.3）
+      setGenNote({
+        err: caps.status === "ready"
+          ? caps.data.generate.message ?? caps.data.generate.reason ?? ""
+          : "",
+      });
+      return;
+    }
+    setGenBusy(true);
+    setGenNote(null);
+    setGenResult(null);
+    try {
+      const r = await api.generateShots(storyboard.data.id);
+      setGenResult(r);
+      if (r.failures.length === 0) {
+        setGenNote({ ok: t("workbench.pipeline.generateDone") });
+      } else {
+        setGenNote({
+          err: t("workbench.pipeline.generatePartial", { n: r.failures.length }),
+        });
+      }
+    } catch (e) {
+      setGenNote(noteFromError(e));
+    } finally {
+      setGenBusy(false);
+    }
+  };
+
+  const editShot = async (shotIdx: number, instruction: string) => {
+    if (storyboard.status !== "ready") return;
+    setEditBusyIdx(shotIdx);
+    setEditNote(null);
+    setEditResult(null);
+    try {
+      const r = await api.editShot(storyboard.data.id, shotIdx, { instruction });
+      setEditResult(r);
+      setEditNote({ ok: t("workbench.pipeline.editDone", { idx: shotIdx }) });
+      // 改完后计划会翻成 edit 模式 —— 重取一次，让用户看到状态已变
+      if (prompts) await loadForm(prompts.id, "generation");
+    } catch (e) {
+      setEditNote(noteFromError(e));
+    } finally {
+      setEditBusyIdx(null);
     }
   };
 
@@ -548,6 +779,15 @@ export default function PipelinePanel() {
       onDownload={() => void download()}
       downloadBusy={downloadBusy}
       downloadNote={downloadNote}
+      caps={caps}
+      onGenerate={() => void generateShots()}
+      genBusy={genBusy}
+      genNote={genNote}
+      genResult={genResult}
+      onEditShot={(idx, instruction) => void editShot(idx, instruction)}
+      editBusyIdx={editBusyIdx}
+      editNote={editNote}
+      editResult={editResult}
     />
   );
 }

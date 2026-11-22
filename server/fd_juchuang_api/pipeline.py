@@ -50,7 +50,11 @@ SHOT_SIZES = ["全景", "中景", "近景", "特写"]
 CAMERA_MOVES = ["固定机位", "缓慢跟拍", "手持轻晃", "正反打"]
 STYLE_ANCHOR = "电影感写实画风，柔和自然光影，35mm 胶片质感，构图克制"
 PROMPT_SCHEMA_VERSION = "1"
-PROMPT_FORMS = ("image", "video", "narrative")
+# 第四形态：`generation` 是可执行的图片生成计划，与三种提示词并列
+# （change juchuang-image-iteration）。它是「怎么生成」而不是「说什么」，
+# 所以必须有幂等键与模式，让重跑不重复计费。
+PROMPT_FORMS = ("image", "video", "narrative", "generation")
+HINT_FORMS = ("image", "video", "narrative")  # 四种里只有这三种是提示词文本
 # 中文台词语速约 3 字/秒；定场/收尾镜的默认时长（秒）
 CHARS_PER_SEC = 3
 ESTABLISH_SEC = 4
@@ -88,6 +92,17 @@ def migrate(conn: sqlite3.Connection) -> None:
             shot TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE (scene_id, idx)
+        );
+        -- change juchuang-image-iteration：镜级图位。一镜一张「当前」图，
+        -- 重生成 = 覆盖；历史留在 VAAS 侧（父子血缘），这里只存当前 + 幂等键。
+        CREATE TABLE IF NOT EXISTS shot_image (
+            scene_id INTEGER NOT NULL,
+            shot_idx INTEGER NOT NULL,
+            asset_id TEXT NOT NULL,
+            slug TEXT,
+            idempotency_key TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (scene_id, shot_idx)
         );
         CREATE TABLE IF NOT EXISTS promptset (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -882,11 +897,95 @@ def _build_narrative_payload(storyboard_id: int, bundle: dict) -> dict:
     }
 
 
+def _idempotency_key(*parts: Any) -> str:
+    """跨进程稳定的内容派生键（不用内置 hash：它按进程加盐）。"""
+    import hashlib
+
+    raw = "\u0000".join("" if p is None else str(p) for p in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _reference_ids(bundle: dict, shot: dict, chars_by_id: dict) -> list[str]:
+    """这一镜要引用的**已绑定**资产 id（model sheet + 场景 art bible）。
+
+    只收已绑定的：没绑定就不给假 id，让下游按纯文本生成。
+    """
+    ids: list[str] = []
+    char = _shot_character(shot, _characters_by_name(bundle))
+    if char and char.get("asset_id"):
+        ids.append(str(char["asset_id"]))
+    scene = bundle.get("scene") or {}
+    if scene.get("asset_id"):
+        ids.append(str(scene["asset_id"]))
+    return ids
+
+
+def _build_generation_payload(storyboard_id: int, bundle: dict,
+                              shots: list[dict]) -> dict:
+    """镜头表 → 可执行生成计划（第四形态）。
+
+    每条含：镜头序号、提示词、模式（generate|edit）、引用资产、源资产（编辑时）、
+    幂等键。**键里必须含源资产 id** —— 否则「对 A 图改外套」与「对 B 图改外套」
+    会撞键返回同一张（design D4，最容易漏的一处）。
+    """
+    chars_by_id = _characters_by_id(bundle)
+    image_payload = _build_image_payload(storyboard_id, bundle, shots)
+    prompts = {p["idx"]: p["prompt"] for p in image_payload["shots"]}
+    # 「这一镜当前是哪张图」来自图位记录（镜级产物），不是 shot JSON ——
+    # shot 是剧本侧结构，图是生成侧结果，两者归属不同层。
+    current = _current_shot_images(os.environ.get("FD_JUCHUANG_DB", "juchuang.db"),
+                                   storyboard_id)
+
+    plan = []
+    for shot in shots:
+        refs = _reference_ids(bundle, shot, chars_by_id)
+        prompt = prompts.get(shot["idx"], shot.get("visual") or "")
+        source = current.get(shot["idx"])
+        mode = "edit" if source else "generate"
+        key = _idempotency_key(
+            storyboard_id, shot["idx"], prompt, mode, source,
+            ",".join(sorted(refs)),
+        )
+        entry = {
+            "shot_idx": shot["idx"],
+            "prompt": prompt,
+            "mode": mode,
+            "reference_asset_ids": refs,
+            "idempotency_key": key,
+        }
+        if source:
+            entry["source_asset_id"] = source
+        plan.append(entry)
+    return {
+        "form": "generation",
+        "schema_version": PROMPT_SCHEMA_VERSION,
+        "storyboard_id": storyboard_id,
+        "scene": bundle["scene"],
+        "shots": plan,
+    }
+
+
+def _current_shot_images(db_path: str, storyboard_id: int) -> dict[int, str]:
+    """{shot_idx: 当前图资产 id}；无记录时返回 {}（计划里即 mode=generate）。"""
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT shot_idx, asset_id FROM shot_image WHERE scene_id = ?",
+            (storyboard_id,),
+        ).fetchall()
+        conn.close()
+        return {int(r["shot_idx"]): r["asset_id"] for r in rows if r["asset_id"]}
+    except sqlite3.Error:
+        return {}
+
+
 def _build_payloads(storyboard_id: int, bundle: dict, shots: list[dict]) -> dict[str, dict]:
     return {
         "image": _build_image_payload(storyboard_id, bundle, shots),
         "video": _build_video_payload(storyboard_id, bundle, shots),
         "narrative": _build_narrative_payload(storyboard_id, bundle),
+        "generation": _build_generation_payload(storyboard_id, bundle, shots),
     }
 
 
@@ -976,3 +1075,155 @@ def export_promptset(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ---------------------------------------------------------------- 生成能力与执行（change juchuang-image-iteration）
+
+
+@router.get("/generate/capabilities")
+def generate_capabilities() -> dict:
+    """出图能力的可用性，**按能力分别判定**（spec「降级独立模式」）。
+
+    文生图可用而编辑不可用是合法状态。前端据此分别禁用按钮，
+    不因一个车道抖动就把整块出图关掉。
+    """
+    from . import vaas_client
+
+    caps = vaas_client.capabilities()
+    return {
+        "configured": vaas_client.configured(),
+        "generate": caps[vaas_client.GENERATE],
+        "edit": caps[vaas_client.EDIT],
+    }
+
+
+# ---------------------------------------------------------------- 4.x 执行：生成与编辑
+
+
+class GenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    shot_idxs: list[int] | None = None      # 省略 = 全场
+    max_calls: int = Field(default=20, ge=1, le=100)
+
+
+def _plan_for(storyboard_id: int, conn: sqlite3.Connection) -> dict:
+    row = conn.execute(
+        "SELECT payload FROM promptset WHERE storyboard_id=? AND form='generation'",
+        (storyboard_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"镜头表 {storyboard_id} 还没有生成计划，先 POST /pipeline/prompts/{storyboard_id}",
+        )
+    return json.loads(row["payload"])
+
+
+def _record_shot_image(conn: sqlite3.Connection, scene_id: int, shot_idx: int,
+                       asset_id: str, slug: str | None, key: str) -> None:
+    conn.execute(
+        "INSERT INTO shot_image (scene_id, shot_idx, asset_id, slug, idempotency_key)"
+        " VALUES (?,?,?,?,?)"
+        " ON CONFLICT(scene_id, shot_idx) DO UPDATE SET"
+        " asset_id=excluded.asset_id, slug=excluded.slug,"
+        " idempotency_key=excluded.idempotency_key, created_at=datetime('now')",
+        (scene_id, shot_idx, asset_id, slug, key),
+    )
+
+
+@router.post("/generate/{storyboard_id}")
+def execute_generation(storyboard_id: int, body: GenerateRequest | None = None) -> dict:
+    """按计划逐镜出图（task 4.1）。
+
+    上限是**硬门**：超了在发起任何付费调用前拒绝（spec「逐镜调用需先确认额度」）。
+    部分失败保留已成功的，逐镜报错，不做整体回滚。
+    """
+    from . import vaas_client
+
+    body = body or GenerateRequest()
+    conn = connect()
+    try:
+        plan = _plan_for(storyboard_id, conn)
+        all_shots = plan["shots"]
+        wanted = set(body.shot_idxs) if body.shot_idxs else None
+        targets = [s for s in all_shots if wanted is None or s["shot_idx"] in wanted]
+
+        if len(targets) > body.max_calls:
+            raise HTTPException(
+                status_code=400,
+                detail=f"本次要生成 {len(targets)} 镜，超过上限 {body.max_calls}；"
+                       f"请缩小范围或调高 max_calls（每一镜都是一次付费调用）",
+            )
+
+        results, failures = [], []
+        for shot in targets:
+            try:
+                out = vaas_client.generate_image(
+                    prompt=shot["prompt"], slug=shot.get("slug"),
+                )
+            except vaas_client.Unavailable as e:
+                failures.append({"shot_idx": shot["shot_idx"],
+                                 "category": e.category, "message": str(e)})
+                continue
+            asset_id = out.get("id") or ""
+            _record_shot_image(conn, storyboard_id, shot["shot_idx"], asset_id,
+                               out.get("slug"), shot["idempotency_key"])
+            results.append({"shot_idx": shot["shot_idx"], "asset_id": asset_id,
+                            "file_paths": out.get("file_paths") or [],
+                            "download_url": out.get("download_url")})
+        conn.commit()
+    finally:
+        conn.close()
+    return {"storyboard_id": storyboard_id, "generated": results,
+            "failures": failures, "requested": len(targets)}
+
+
+class EditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    instruction: str = Field(min_length=1)
+    mask: str | None = None
+
+
+@router.post("/shots/{storyboard_id}/{shot_idx}/edit")
+def execute_edit(storyboard_id: int, shot_idx: int,
+                 body: EditRequest) -> dict:
+    """对某一镜当前图做精细化修改（task 4.2）。
+
+    「改这一镜」只动这一镜：源必须是该镜已生成的图，否则没有可改的东西。
+    编辑不可用时**不静默退回生成**（spec 明写禁止）——报告类别，让前端禁按钮。
+    """
+    from . import vaas_client
+
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT asset_id, idempotency_key FROM shot_image"
+            " WHERE scene_id=? AND shot_idx=?", (storyboard_id, shot_idx),
+        ).fetchone()
+        if row is None or not row["asset_id"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"第 {shot_idx} 镜还没有图，先执行生成再修改",
+            )
+        source = row["asset_id"]
+        # 编辑键与生成键必须不同（含源资产 + 指令），否则「改 A」会命中「生成 A」
+        key = _idempotency_key(storyboard_id, shot_idx, body.instruction,
+                              "edit", source, "")
+        try:
+            out = vaas_client.edit_image(
+                source=source, instruction=body.instruction, mask=body.mask,
+            )
+        except vaas_client.Unavailable as e:
+            raise HTTPException(status_code=503,
+                                detail=f"{e.category}: {e}") from e
+        new_id = out.get("id") or ""
+        _record_shot_image(conn, storyboard_id, shot_idx, new_id,
+                           out.get("slug"), key)
+        conn.commit()
+    finally:
+        conn.close()
+    return {"storyboard_id": storyboard_id, "shot_idx": shot_idx,
+            "asset_id": new_id, "source_asset_id": source,
+            "file_paths": out.get("file_paths") or [],
+            "download_url": out.get("download_url"),
+            "warnings": out.get("warnings") or []}

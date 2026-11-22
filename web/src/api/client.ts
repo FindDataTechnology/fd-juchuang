@@ -262,8 +262,56 @@ export interface Storyboard {
   shots?: StoryboardShot[];
 }
 
-export type PromptForm = "image" | "video" | "narrative";
-export const PROMPT_FORMS: readonly PromptForm[] = ["image", "video", "narrative"];
+// change juchuang-image-iteration：新增第四形态 `generation`（可执行生成计划）。
+// 三种提示词形态仍是「说什么」；generation 是「怎么生成」，带幂等键与模式。
+export type PromptForm = "image" | "video" | "narrative" | "generation";
+export const PROMPT_FORMS: readonly PromptForm[] = [
+  "image",
+  "video",
+  "narrative",
+  "generation",
+];
+
+/** 出图能力：generate 与 edit **各自独立**（spec「降级独立模式」）。 */
+export interface CapabilityState {
+  available: boolean;
+  reason?: string;
+  message?: string;
+  generator?: string;
+  lane?: { health?: string; reason_class?: string | null };
+}
+export interface GenerateCapabilities {
+  configured: boolean;
+  generate: CapabilityState;
+  edit: CapabilityState;
+}
+
+export interface ShotGeneration {
+  shot_idx: number;
+  asset_id: string;
+  file_paths?: string[];
+  download_url?: string | null;
+}
+export interface GenerationFailure {
+  shot_idx: number;
+  category: string;
+  message: string;
+}
+export interface GenerationResult {
+  storyboard_id: number | string;
+  generated: ShotGeneration[];
+  failures: GenerationFailure[];
+  requested: number;
+}
+export interface EditResult {
+  storyboard_id: number | string;
+  shot_idx: number;
+  asset_id: string;
+  source_asset_id: string;
+  file_paths?: string[];
+  download_url?: string | null;
+  warnings?: string[];
+}
 
 export interface KernelCard {
   id: string;
@@ -567,4 +615,17 @@ export const api = {
     request<PromptSetRef>(`/api/v1/pipeline/prompts/${enc(storyboardId)}`, { method: "POST", body: {} }),
   getPrompt: (promptSetId: string, form: PromptForm) =>
     request<unknown>(`/api/v1/pipeline/prompts/${enc(promptSetId)}`, { query: { form } }),
+
+  // 出图：能力探测 / 按计划生成 / 改这一镜（change juchuang-image-iteration）
+  getGenerateCapabilities: () => request<GenerateCapabilities>("/api/v1/pipeline/generate/capabilities"),
+  generateShots: (storyboardId: string, b: { shot_idxs?: number[]; max_calls?: number } = {}) =>
+    request<GenerationResult>(`/api/v1/pipeline/generate/${enc(storyboardId)}`, {
+      method: "POST",
+      body: b,
+    }),
+  editShot: (storyboardId: string, shotIdx: number, b: { instruction: string; mask?: string }) =>
+    request<EditResult>(
+      `/api/v1/pipeline/shots/${enc(storyboardId)}/${enc(String(shotIdx))}/edit`,
+      { method: "POST", body: b },
+    ),
 };

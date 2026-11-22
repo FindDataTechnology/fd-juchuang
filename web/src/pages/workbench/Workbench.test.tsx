@@ -125,6 +125,15 @@ describe("API 全挂时的降级态", () => {
         onDownload={noop}
         downloadBusy={false}
         downloadNote={null}
+      caps={{ status: "ready", data: { configured: true, generate: { available: true }, edit: { available: true } } }}
+      onGenerate={() => {}}
+      genBusy={false}
+      genNote={null}
+      genResult={null}
+      onEditShot={() => {}}
+      editBusyIdx={null}
+      editNote={null}
+      editResult={null}
       />,
     );
     expect(html).toContain("接线中");
@@ -327,6 +336,15 @@ describe("就绪态关键渲染", () => {
         onDownload={noop}
         downloadBusy={false}
         downloadNote={null}
+      caps={{ status: "ready", data: { configured: true, generate: { available: true }, edit: { available: true } } }}
+      onGenerate={() => {}}
+      genBusy={false}
+      genNote={null}
+      genResult={null}
+      onEditShot={() => {}}
+      editBusyIdx={null}
+      editNote={null}
+      editResult={null}
       />,
     );
     // 表头与镜头行

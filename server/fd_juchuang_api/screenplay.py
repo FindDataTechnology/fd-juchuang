@@ -126,8 +126,14 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 # 既有库补列（CREATE TABLE IF NOT EXISTS 不会改旧表；幂等 ALTER，不碰 user_version）
 _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
-    "scenes": {"action": "TEXT", "transition": "TEXT"},
+    # change juchuang-image-iteration：model sheet / art bible 绑定为生成侧真资产。
+    # 加列不建表 —— 绑定是 1:1（一个角色一个定妆照），历史行留空即可。
+    # 原有的 appearance / art_bible 字符串字段**保持不变**：绑定是附加信息，
+    # 导出 MUST 不依赖它（spec「资产绑定不破坏导出」）。
+    "scenes": {"action": "TEXT", "transition": "TEXT",
+               "asset_id": "TEXT", "asset_slug": "TEXT"},
     "lines": {"parenthetical": "TEXT"},
+    "characters": {"asset_id": "TEXT", "asset_slug": "TEXT"},
 }
 
 
@@ -281,17 +287,29 @@ def _project_dict(r: sqlite3.Row) -> dict:
             "created_at": r["created_at"]}
 
 
+def _asset_fields(r: sqlite3.Row) -> dict:
+    """绑定资产（change juchuang-image-iteration）。旧行没有这两列的值 → None。
+
+    单独拎出来是因为两个 dict 构造都要它，而 sqlite3.Row 缺列会抛 IndexError，
+    所以按 keys() 探测而不是直接下标。
+    """
+    keys = r.keys()
+    return {"asset_id": r["asset_id"] if "asset_id" in keys else None,
+            "asset_slug": r["asset_slug"] if "asset_slug" in keys else None}
+
+
 def _character_dict(r: sqlite3.Row) -> dict:
     return {"id": r["id"], "project_id": r["project_id"], "name": r["name"],
             "appearance": _loads(r["appearance"]), "stance": _loads(r["stance"]),
-            "created_at": r["created_at"]}
+            "created_at": r["created_at"], **_asset_fields(r)}
 
 
 def _scene_dict(r: sqlite3.Row) -> dict:
     return {"id": r["id"], "project_id": r["project_id"], "idx": r["idx"],
             "title": r["title"], "synopsis": r["synopsis"],
             "action": r["action"], "transition": r["transition"],
-            "conflict": _loads(r["conflict"]), "created_at": r["created_at"]}
+            "conflict": _loads(r["conflict"]), "created_at": r["created_at"],
+            **_asset_fields(r)}
 
 
 def _line_dict(r: sqlite3.Row) -> dict:
@@ -1291,5 +1309,61 @@ def scene_bundle(scene_id: int) -> dict | None:
                 ).fetchall()
             ],
         }
+    finally:
+        conn.close()
+
+
+# ==== 资产绑定（change juchuang-image-iteration）====
+
+
+class AssetBinding(BaseModel):
+    """把 model sheet / art bible 绑成生成侧真资产。
+
+    `asset_id` 由外部给（VAAS 返回的资产 id）；`asset_slug` 可选，便于人读。
+    绑定是附加信息：`appearance` / `art_bible` 等原字符串字段一律不动，
+    导出不依赖绑定（spec「资产绑定不破坏导出」）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    asset_id: str = Field(min_length=1)
+    asset_slug: str | None = None
+
+
+def _bind_asset(conn: sqlite3.Connection, table: str, row_id: int,
+                body: AssetBinding) -> dict:
+    conn.execute(
+        f"UPDATE {table} SET asset_id=?, asset_slug=? WHERE id=?",
+        (body.asset_id, body.asset_slug, row_id),
+    )
+    conn.commit()
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+    return _character_dict(row) if table == "characters" else _scene_dict(row)
+
+
+@router.post("/projects/{pid}/characters/{cid}/asset")
+def bind_character_asset(pid: int, cid: int, body: AssetBinding,
+                         user_id: str = Depends(require_user)) -> dict:
+    """角色 model sheet 绑定（幂等：同 asset_id 重复调用结果一致）。"""
+    conn = _db()
+    try:
+        row = _need_character(conn, user_id, pid, cid)
+        return _bind_asset(conn, "characters", row["id"], body)
+    finally:
+        conn.close()
+
+
+@router.post("/projects/{pid}/scenes/{sid}/asset")
+def bind_scene_asset(pid: int, sid: int, body: AssetBinding,
+                     user_id: str = Depends(require_user)) -> dict:
+    """场景/道具 art bible 绑定（幂等）。"""
+    conn = _db()
+    try:
+        conn_row = conn.execute(
+            "SELECT * FROM scenes WHERE id=? AND project_id=?", (sid, pid)
+        ).fetchone()
+        if conn_row is None:
+            raise HTTPException(status_code=404, detail="场次不存在")
+        _need_project(conn, user_id, pid)
+        return _bind_asset(conn, "scenes", sid, body)
     finally:
         conn.close()

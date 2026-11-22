@@ -524,10 +524,12 @@ def storyboard_step(client, report: Report, sample: dict) -> dict:
     code, prompts = client.call("POST", f"{API}/pipeline/prompts/{scene1}")
     _ensure(report, "storyboard.prompts", code, prompts)
     forms = {item["form"] for item in prompts.get("promptsets") or []}
+    # change juchuang-image-iteration：新增第四形态 `generation`（可执行生成计划）。
+    # 断言从「恰好三形态」改为「四种都必须在」——原来的 == 会在每次加形态时误报。
     report.expect(
         "storyboard.prompts",
-        forms == {"image", "video", "narrative"},
-        f"三形态提示词缺失：{forms}",
+        {"image", "video", "narrative", "generation"} <= forms,
+        f"四形态提示词缺失：{forms}",
     )
     image_promptset = next(
         item for item in prompts["promptsets"] if item["form"] == "image"

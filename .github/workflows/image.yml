@@ -47,6 +47,10 @@ jobs:
     with:
       image: fd-juchuang-web
       namespace: finddata-business
+      # 本仓两个 Dockerfile 各在自己的子目录；不传会默认找根 Dockerfile 而失败
+      # （2026-11-22 实测：`open Dockerfile: no such file or directory`）。
+      dockerfile: web/Dockerfile
+      context: web
 
   fd-juchuang-api:
     needs: api-test
@@ -55,3 +59,5 @@ jobs:
     with:
       image: fd-juchuang-api
       namespace: finddata-business
+      dockerfile: server/Dockerfile
+      context: server

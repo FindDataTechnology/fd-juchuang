@@ -186,3 +186,106 @@ def edit_image(source: str, instruction: str, slug: str | None = None,
     if n and n > 1:
         args["n"] = n
     return _call_tool("edit_image", args)
+
+# ─── 视频（change juchuang-video-generation）─────────────────────────────────
+
+VIDEO = "video"
+
+
+def video_capabilities() -> dict:
+    """图生视频与成片渲染**分别**判定（spec：两条通路互不代表）。
+
+    图生视频依赖首帧支持（VAAS `video.grok.first_frame.supported`）；
+    成片渲染是本地算力，只要 VAAS 可达就可用。
+    """
+    out: dict[str, Any] = {
+        "i2v": {"available": False},
+        "render": {"available": False},
+    }
+    if not configured():
+        for cap in out.values():
+            cap.update(reason="unconfigured",
+                       message="VAAS_MCP_URL / VAAS_SERVICE_TOKEN 未配置")
+        return out
+    try:
+        listing = _call_tool("registry_list_generators", {"type": "video"}, timeout=30)
+    except Unavailable as e:
+        out["i2v"].update(reason=e.category, message=str(e))
+        out["render"].update(reason=e.category, message=str(e))
+        return out
+
+    for entry in listing.get("items", []):
+        lane = entry.get("lane") or {}
+        if lane.get("health") == "active":
+            out["i2v"] = {
+                "available": True,
+                "generator": entry.get("name"),
+                "lane": lane,
+                # 首帧是否被验证过。VAAS 的台账把它独立成字段，
+                # 不写进 reason 文本——这里正因如此才读得到。
+                "first_frame_supported": lane.get("first_frame_supported"),
+            }
+        elif not out["i2v"].get("available"):
+            out["i2v"] = {"available": False, "reason": "lane_down",
+                          "message": f"{entry.get('name')} lane is {lane.get('health')}",
+                          "lane": lane}
+
+    # 成片渲染走本仓自己的 render_video（本地算力）；只要 VAAS 可达即视为可用。
+    if _render_available():
+        out["render"] = {"available": True, "cost": "local"}
+    else:
+        out["render"] = {"available": False, "reason": "unconfigured",
+                         "message": "渲染面不可达"}
+    return out
+
+
+def _render_available() -> bool:
+    """render_video 是 VAAS 的本地算力工具：能列出工具就说明宿主在。"""
+    try:
+        _call_tool("templates_list", {}, timeout=20)
+        return True
+    except Unavailable:
+        return False
+
+
+def submit_video(prompt: str, first_frame: str | None = None,
+                 duration: int | None = None, ratio: str | None = None,
+                 resolution: str | None = None, slug: str | None = None) -> dict:
+    """提交异步视频任务，秒级返回 job_id（不要在这里等出片）。"""
+    args: dict[str, Any] = {"prompt": prompt}
+    if first_frame:
+        args["first_frame"] = first_frame
+    if duration:
+        args["duration"] = duration
+    if ratio:
+        args["ratio"] = ratio
+    if resolution:
+        args["resolution"] = resolution
+    if slug:
+        args["slug"] = slug
+    return _call_tool("generate_video_submit", args, timeout=180)
+
+
+def video_status(job_id: str) -> dict:
+    return _call_tool("video_job_status", {"job_id": job_id}, timeout=60)
+
+
+def render_carousel(script: str, inputs: dict, slug: str | None = None) -> dict:
+    """成片渲染：把 carousel 的 inputs 交渲染面（零上游成本、确定性）。"""
+    args: dict[str, Any] = {"type": "carousel", "script": script, "inputs": inputs}
+    if slug:
+        args["slug"] = slug
+    return _call_tool("render_video", args, timeout=900)
+
+
+def asset_file_path(asset_id: str) -> str | None:
+    """账本 id → 渲染面可用的文件路径（downloads 相对路径）。
+
+    VAAS 的 renders/render_video 只认文件路径；账本 id 是给它自己的生成/编辑
+    接口用的。两者不能混（2026-11-22 实测：传 id 报 `carousel image not found`）。
+    """
+    try:
+        detail = _call_tool("assets_get", {"id": asset_id}, timeout=30)
+    except Unavailable:
+        return None
+    return detail.get("file_path") or (detail.get("asset") or {}).get("file_path")

@@ -1227,3 +1227,186 @@ def execute_edit(storyboard_id: int, shot_idx: int,
             "file_paths": out.get("file_paths") or [],
             "download_url": out.get("download_url"),
             "warnings": out.get("warnings") or []}
+
+
+# ---------------------------------------------------------------- 视频：两条成片通路
+
+
+class VideoRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    route: str = Field(pattern="^(i2v|render)$")
+    shot_idxs: list[int] | None = None
+    max_calls: int = Field(default=20, ge=1, le=100)
+    confirm: bool = False          # i2v 必须先确认（按次付费）
+
+
+@router.get("/video/capabilities")
+def video_capabilities() -> dict:
+    """两条成片通路**分别**判定（spec：互不代表）。"""
+    from . import vaas_client
+    return vaas_client.video_capabilities()
+
+
+def _shot_images(conn: sqlite3.Connection, scene_id: int) -> dict[int, str]:
+    """{镜号: 资产 id}。资产 id 是**账本**标识，不是文件路径——两者用途不同：
+    - 编辑 / 图生视频的首帧：传资产 id（VAAS 自己会解析）；
+    - 成片渲染的图清单：VAAS 渲染面只认**文件路径**，不认账本 id。
+      2026-11-22 实测：传 id 会报 `carousel image not found: <uuid>`。
+    所以调用方按需取：`_shot_image_paths` 供渲染，本函数供生成/编辑。
+    """
+    rows = conn.execute(
+        "SELECT shot_idx, asset_id FROM shot_image WHERE scene_id=?", (scene_id,)
+    ).fetchall()
+    return {int(r["shot_idx"]): r["asset_id"] for r in rows if r["asset_id"]}
+
+
+def _shot_image_paths(images: dict[int, str]) -> dict[int, str]:
+    """资产 id → 渲染面可用的文件路径（downloads 相对路径，VAAS 侧可解析）。"""
+    from . import vaas_client
+
+    out: dict[int, str] = {}
+    for idx, aid in images.items():
+        path = vaas_client.asset_file_path(aid)
+        if path:
+            out[idx] = path
+    return out
+
+
+def _shots_for(scene_id: int, conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT idx, shot FROM storyboard WHERE scene_id=? ORDER BY idx", (scene_id,)
+    ).fetchall()
+    out = []
+    for r in rows:
+        shot = json.loads(r["shot"])
+        shot.setdefault("idx", r["idx"])
+        out.append(shot)
+    return out
+
+
+@router.post("/video/{storyboard_id}")
+def create_video(storyboard_id: int, body: VideoRequest) -> dict:
+    """分镜 → 成片。两条路各自可算成本、各自可降级（design D1）。"""
+    from . import storyboard_render, vaas_client
+
+    conn = connect()
+    try:
+        shots = _shots_for(storyboard_id, conn)
+        if not shots:
+            raise HTTPException(status_code=404,
+                                detail=f"镜头表 {storyboard_id} 不存在")
+        images = _shot_images(conn, storyboard_id)
+        # 渲染面只认文件路径；账本 id 只给生成/编辑用（见 _shot_image_paths 注释）。
+        # 取不到路径的镜**不放进图清单**，由 compile_carousel 按「缺图」报出来——
+        # 静默少一段是最糟的失败形态。
+        from . import vaas_client as _vc
+        render_paths = {}
+        for idx, aid in images.items():
+            p = _vc.asset_file_path(aid)
+            if p:
+                render_paths[idx] = p
+        plan = storyboard_render.compile_carousel({"shots": shots}, render_paths)
+    finally:
+        conn.close()
+
+    if plan["missing"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": f"这些镜头还没有图：{plan['missing']}",
+                    "missing": plan["missing"]},
+        )
+
+    if body.route == "render":
+        return _video_render(storyboard_id, plan)
+    return _video_i2v(storyboard_id, plan, shots, images, body)
+
+
+def _video_render(storyboard_id: int, plan: dict) -> dict:
+    from . import vaas_client
+
+    slug = f"jc-carousel-{storyboard_id}"
+    try:
+        out = vaas_client.render_carousel(
+            script=plan["script"],
+            inputs={"images": plan["images"]},
+            slug=slug,
+        )
+    except vaas_client.Unavailable as e:
+        raise HTTPException(status_code=503, detail=f"{e.category}: {e}") from e
+    # render_video 回的是 `file_path`（单数）——与 generate_* 的 `file_paths` 不同形状。
+    # 2026-11-22 实测：按 file_paths 取会拿到空数组，看起来像「渲染没出片」。
+    fpath = out.get("file_path")
+    return {
+        "storyboard_id": storyboard_id,
+        "route": "render",
+        "cost": "local",                     # 零上游成本
+        "asset_id": out.get("id"),
+        "slug": out.get("slug") or slug,
+        "file_paths": [fpath] if fpath else [],
+        "download_url": out.get("download_url"),
+        "segments": plan["segments"],        # 哪一段对应哪一镜
+        "duration_source": plan["duration_source"],
+        "note": "段时长以音频为准，不按镜头 duration_sec 强制定长",
+    }
+
+
+def _video_i2v(storyboard_id: int, plan: dict, shots: list[dict],
+               images: dict[int, str], body: VideoRequest) -> dict:
+    from . import vaas_client
+
+    caps = vaas_client.video_capabilities()
+    if not caps["i2v"].get("available"):
+        # 不可用时**不发起任何调用**，也不静默退回 render（那是另一个产物）
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "图生视频不可用", "reason": caps["i2v"].get("reason"),
+                    "detail": caps["i2v"].get("message")},
+        )
+    if not caps["i2v"].get("first_frame_supported", False):
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "该车道未验证支持首帧，图生视频会退化成纯文生视频",
+                    "reason": "first_frame_unverified"},
+        )
+
+    wanted = set(body.shot_idxs) if body.shot_idxs else None
+    targets = [s for s in shots if wanted is None or s["idx"] in wanted]
+    if len(targets) > body.max_calls:
+        raise HTTPException(
+            status_code=400,
+            detail=f"本次要生成 {len(targets)} 镜，超过上限 {body.max_calls}"
+                   f"（每镜一次付费调用）",
+        )
+    if not body.confirm:
+        # 发起前必须让人看到次数与时长（spec「逐镜调用需先确认额度」）
+        return {
+            "storyboard_id": storyboard_id, "route": "i2v", "confirmed": False,
+            "estimated_calls": len(targets),
+            "estimated_seconds": sum(int(s.get("duration_sec") or 3) for s in targets),
+            "cost": "per_second",
+            "note": "确认后再提交（confirm=true）",
+        }
+
+    submitted, failures = [], []
+    for shot in targets:
+        idx = shot["idx"]
+        prompt = (shot.get("visual") or shot.get("action") or shot.get("line") or "").strip() \
+                 or f"第 {idx} 镜"
+        try:
+            out = vaas_client.submit_video(
+                prompt=prompt,
+                first_frame=images.get(idx),
+                duration=int(shot.get("duration_sec") or 3),
+                slug=f"jc-i2v-{storyboard_id}-{idx}",
+            )
+        except vaas_client.Unavailable as e:
+            failures.append({"shot_idx": idx, "category": e.category, "message": str(e)})
+            continue
+        submitted.append({"shot_idx": idx, "job_id": out.get("job_id"),
+                          "provider_task_id": out.get("provider_task_id")})
+    return {
+        "storyboard_id": storyboard_id, "route": "i2v", "confirmed": True,
+        "submitted": submitted, "failures": failures,
+        "requested": len(targets),
+        "note": "视频是异步的：用 job_id 查 video_job_status",
+    }

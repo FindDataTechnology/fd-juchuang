@@ -5,7 +5,7 @@
 **两套系统之间的协议真的对得上**——字段名、身份头、SSE 分帧、签名 URL。
 
 跑法（要真 VAAS，会产生计费）：
-  VAAS_MCP_URL=http://100.64.0.17:30950/mcp \
+  VAAS_MCP_URL=<vaas-mcp-endpoint>/mcp \
   VAAS_SERVICE_TOKEN=<bearer> \
   FD_JUCHUANG_DB=/tmp/e2e.db FD_JUCHUANG_AUTH_DEV_TOKENS=tok=u \
   python scripts/e2e_juchuang_vaas.py

@@ -31,11 +31,30 @@ def _dev_tokens() -> dict[str, str]:
     return out
 
 
+def _audiences() -> list[str] | None:
+    """允许逗号分隔的多个 audience；空则返回 None（表示不校验）。
+
+    **为什么必须配**：不配的时候 `verify_aud` 是关的，而 `FD_JUCHUANG_AUTH_JWKS`
+    指向的是整个 Logto 租户的 JWKS —— 于是**任何**一条本租户签发的 JWT 都能进
+    剧创，`sub` 被当成 user_id。实际有两条合法来路，aud 各不相同：
+
+      - 网页用户：ID token（scope 只有 openid/profile/offline_access，无 resource）
+        ⇒ aud = client_id `xlp6cjguc16zkxz7hc3d9`（线上 bundle 实测）
+      - 机器调方：client_credentials（resource=https://mcp.finddatatech.cloud/api）
+        ⇒ aud = 那个 resource
+
+    只认一个会把另一条路打死；所以这里收一个**白名单**，逗号分隔。
+    """
+    raw = os.environ.get("FD_JUCHUANG_AUTH_AUDIENCE", "")
+    vals = [a.strip() for a in raw.split(",") if a.strip()]
+    return vals or None
+
+
 def _verify_jwt(token: str) -> str:
     import jwt  # pyjwt
 
     jwks_url = os.environ.get("FD_JUCHUANG_AUTH_JWKS", "")
-    audience = os.environ.get("FD_JUCHUANG_AUTH_AUDIENCE", "")
+    audience = _audiences()
     if not jwks_url:
         raise Unauthorized("JWT 校验未配置（FD_JUCHUANG_AUTH_JWKS）")
     from jwt import PyJWKClient
